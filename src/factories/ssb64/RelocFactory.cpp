@@ -348,6 +348,33 @@ void ApplyStructU32Fixup(uint8_t* base, uint32_t num_words) {
     }
 }
 
+// Mirrors portFixupFTAttributes in port/bridge/lbreloc_byteswap.cpp.
+// FTAttributes layout (0x348 bytes = 210 words). Most fields are f32/s32/u32
+// types that are correct after pass1; only these 10 word slots need fixing:
+//   w[0x2D] rotate16  u16 dead_fgm_ids[0..1]
+//   w[0x2E] rotate16  u16 deadup_sfx, damage_sfx
+//   w[0x2F] rotate16  u16 smash_sfx[0..1]
+//   w[0x30] rotate16  u16 smash_sfx[2], pad
+//   w[0x39] rotate16  u16 itemthrow_vel_scale, damage_scale
+//   w[0x3A] rotate16  u16 heavyget_sfx, pad
+//   w[0x3C] bswap32   SYColorRGBA shade_color[0]
+//   w[0x3D] bswap32   SYColorRGBA shade_color[1]
+//   w[0x3E] bswap32   SYColorRGBA shade_color[2]
+//   w[0x3F] bswap32   SYColorRGBA fog_color
+void ApplyFTAttributesFixup(uint8_t* base) {
+    Rotate16Bytes(base + 0x2D * 4);
+    Rotate16Bytes(base + 0x2E * 4);
+    Rotate16Bytes(base + 0x2F * 4);
+    Rotate16Bytes(base + 0x30 * 4);
+    Rotate16Bytes(base + 0x39 * 4);
+    Rotate16Bytes(base + 0x3A * 4);
+    Bswap32Bytes (base + 0x3C * 4);
+    Bswap32Bytes (base + 0x3D * 4);
+    Bswap32Bytes (base + 0x3E * 4);
+    Bswap32Bytes (base + 0x3F * 4);
+}
+constexpr uint32_t kFTAttributesSize = 0x348;
+
 // Walks the catalog for `file_id`, applies each in-scope family transform to
 // `data` in place, and returns the OR'd PROC_<FAMILY>_DONE bits for the
 // families that were actually touched. `data` must already have pass1+pass2
@@ -393,7 +420,12 @@ uint32_t ApplyStructFixupsInPlace(std::vector<uint8_t>& data, uint32_t file_id) 
             flags_set |= kProcStructU32Done;
             break;
         }
-        // Other families land in subsequent Stage 6d steps.
+        case SSB64::StructFixupCatalog::FTATTRIBUTES: {
+            if (e->byte_offset + kFTAttributesSize > file_size) continue;
+            ApplyFTAttributesFixup(data.data() + e->byte_offset);
+            flags_set |= kProcFtAttributesDone;
+            break;
+        }
         default:
             break;
         }
