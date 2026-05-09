@@ -11,6 +11,8 @@
 #include <iomanip>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 extern "C" {
 #include <libvpk0/vpk0.h>
@@ -700,6 +702,138 @@ std::vector<char> BuildSubResourceBlob(const std::vector<uint8_t>& data,
     return blobWriter.ToVector();
 }
 
+// Reads a 16-bit signed little-endian word from `data[off..off+2]`. The
+// post-pass1+rotate16 fixup leaves s16 fields in native LE byte order, so
+// torch can read them with this helper without round-tripping through the
+// runtime's portFixup* helpers.
+inline int16_t ReadS16LE(const std::vector<uint8_t>& data, size_t off) {
+    return static_cast<int16_t>(
+        static_cast<uint16_t>(data[off]) |
+        (static_cast<uint16_t>(data[off + 1]) << 8));
+}
+
+// Maps Sprite.bmsiz (G_IM_SIZ_*) to bits-per-pixel. Mirrors the switch in
+// portFixupSpriteBitmapData (port/bridge/lbreloc_byteswap.cpp): 0=4b, 1=8b,
+// 2=16b, 3=32b, 4=4c. Returns 0 for unsupported values; the caller skips
+// emission so we don't fabricate a buffer size for an unknown format.
+//
+// 4c is intentionally returned as 0 (skip): on-disk it's a half-width
+// compressed source that the runtime decompresses to 4bpp before drawing.
+// The runtime's tex_bytes formula uses bpp=4 for 4c — matching what we'd
+// emit here would over-cover the on-disk buffer by 2x and a modder's
+// override would clobber adjacent file bytes. 4c modding can use the
+// whole-container override pathway (Stage 10 follow-up L) instead.
+inline int BmsizToBpp(uint8_t bmsiz) {
+    switch (bmsiz) {
+    case 0: return 4;
+    case 1: return 8;
+    case 2: return 16;
+    case 3: return 32;
+    default: return 0;
+    }
+}
+
+// Walks the SPRITE entries in `file_id`'s catalog slice and emits Tex /
+// Tlut sub-resources for the chain-targeted pixel buffers and palettes —
+// the Stage-10 enumerator otherwise misses them because ScanDisplayLists
+// only catches intra-DL `seg=0x0E` references, which are common in menus
+// but rare in fighter / stage assets where most textures resolve through
+// `Bitmap.buf` reloc tokens.
+//
+// Sprite-side chain slots (post-pass1+portFixupSprite byte layout):
+//   S+0x20 : LUT          (nTLUT × 2 bytes when nTLUT > 0)
+//   S+0x34 : bitmap array (nbitmaps × kBitmapSize bytes)
+// Bitmap-side chain slot (post-pass1+portFixupBitmap):
+//   B+0x08 : pixel buffer (width_img × actualHeight × bpp / 8 bytes)
+//
+// `chainSlotMap` precomputes (slot_byte_off → target_byte_off) for both
+// intern + extern chains. `bitmapInCatalog` filters bitmaps that are
+// guaranteed post-rotate16 (i.e. width_img/actualHeight live where this
+// helper expects); a bitmap reachable from a Sprite but not in the BITMAP
+// catalog is in pass1-only state and must be skipped to avoid reading
+// width/width_img at the wrong byte offsets.
+void EmitChainPixelBuffers(const std::vector<uint8_t>& data,
+                           uint32_t file_id,
+                           const std::string& entryOtrPath,
+                           const std::unordered_map<uint32_t, uint32_t>& chainSlotMap,
+                           const std::unordered_set<uint32_t>& bitmapInCatalog,
+                           std::vector<SubResource>& out) {
+    const size_t file_size = data.size();
+    auto [first, last] = SSB64::StructFixupCatalog::EntriesForFile(
+        static_cast<uint16_t>(file_id));
+
+    for (const auto* e = first; e != last; ++e) {
+        if (e->family != SSB64::StructFixupCatalog::SPRITE) continue;
+        const uint32_t S = e->byte_offset;
+        if (S + kSpriteSize > file_size) continue;
+
+        const int16_t nbitmaps = ReadS16LE(data, S + 0x28);
+        const int16_t nTLUT    = ReadS16LE(data, S + 0x1E);
+        const uint8_t bmsiz    = data[S + 0x31];
+
+        // (a) Per-Bitmap pixel buffers.
+        if (nbitmaps > 0) {
+            auto bm_it = chainSlotMap.find(S + 0x34);
+            const int bpp = BmsizToBpp(bmsiz);
+            if (bm_it != chainSlotMap.end() && bpp > 0) {
+                const uint32_t bm_array_off = bm_it->second;
+                for (int i = 0; i < nbitmaps; i++) {
+                    const uint32_t B =
+                        bm_array_off + static_cast<uint32_t>(i) * kBitmapSize;
+                    if (static_cast<size_t>(B) + kBitmapSize > file_size) break;
+                    if (bitmapInCatalog.count(B) == 0) continue;
+                    const int16_t width_img    = ReadS16LE(data, B + 0x02);
+                    const int16_t actualHeight = ReadS16LE(data, B + 0x0C);
+                    if (width_img <= 0 || actualHeight <= 0) continue;
+
+                    auto buf_it = chainSlotMap.find(B + 0x08);
+                    if (buf_it == chainSlotMap.end()) continue;
+                    const uint32_t pixel_off = buf_it->second;
+
+                    const size_t num_texels =
+                        static_cast<size_t>(width_img) *
+                        static_cast<size_t>(actualHeight);
+                    size_t tex_bytes = (num_texels * static_cast<size_t>(bpp) + 7) / 8;
+                    tex_bytes = (tex_bytes + 3) & ~size_t{3};
+                    if (tex_bytes == 0) continue;
+                    if (static_cast<size_t>(pixel_off) > file_size) continue;
+                    if (tex_bytes > (file_size - pixel_off)) continue;
+
+                    SubResource sr{};
+                    sr.byte_offset = pixel_off;
+                    sr.size        = static_cast<uint32_t>(tex_bytes);
+                    sr.kind        = SubResKind::Tex;
+                    sr.hash        = CRC64(
+                        SubResourceOtrPath(entryOtrPath, sr.kind, pixel_off).c_str());
+                    out.push_back(sr);
+                }
+            }
+        }
+
+        // (b) Sprite-level TLUT (paletted sprites). Same N64 RGBA16 packing
+        // as in-DL Tlut blocks — 2 bytes per entry, word-aligned.
+        if (nTLUT > 0) {
+            auto lut_it = chainSlotMap.find(S + 0x20);
+            if (lut_it != chainSlotMap.end()) {
+                const uint32_t lut_off = lut_it->second;
+                uint32_t tlut_bytes = static_cast<uint32_t>(nTLUT) * 2u;
+                tlut_bytes = (tlut_bytes + 3) & ~3u;
+                if (tlut_bytes > 0
+                    && static_cast<size_t>(lut_off) <= file_size
+                    && static_cast<size_t>(tlut_bytes) <= (file_size - lut_off)) {
+                    SubResource sr{};
+                    sr.byte_offset = lut_off;
+                    sr.size        = tlut_bytes;
+                    sr.kind        = SubResKind::Tlut;
+                    sr.hash        = CRC64(
+                        SubResourceOtrPath(entryOtrPath, sr.kind, lut_off).c_str());
+                    out.push_back(sr);
+                }
+            }
+        }
+    }
+}
+
 // Walks `data` (post all transforms) plus the struct catalog and emits one
 // SubResource per Vtx run / texture image / palette / fixed-up struct. The
 // path is computed via SubResourceOtrPath; the bytes are registered with
@@ -719,7 +853,9 @@ std::vector<char> BuildSubResourceBlob(const std::vector<uint8_t>& data,
 std::vector<SubResource>
 EmitSubResources(const std::vector<uint8_t>& data,
                  uint32_t file_id,
-                 const std::string& entryOtrPath) {
+                 const std::string& entryOtrPath,
+                 const std::vector<ChainEntryOut>& internEntries,
+                 const std::vector<ChainEntryOut>& externEntries) {
     std::vector<SubResource> out;
     const size_t file_size = data.size();
     if (file_size == 0) return out;
@@ -741,6 +877,7 @@ EmitSubResources(const std::vector<uint8_t>& data,
     }
 
     // (b) Catalog entries — sprite, bitmap, mobjsub, struct_u16, struct_u32, ftattributes.
+    std::unordered_set<uint32_t> bitmapInCatalog;
     auto [first, last] = SSB64::StructFixupCatalog::EntriesForFile(
         static_cast<uint16_t>(file_id));
     for (const auto* e = first; e != last; ++e) {
@@ -756,7 +893,23 @@ EmitSubResources(const std::vector<uint8_t>& data,
         sr.kind        = kind;
         sr.hash        = CRC64(SubResourceOtrPath(entryOtrPath, kind, e->byte_offset).c_str());
         out.push_back(sr);
+        if (e->family == SSB64::StructFixupCatalog::BITMAP) {
+            bitmapInCatalog.insert(e->byte_offset);
+        }
     }
+
+    // (c) Chain-resolved pixel buffers + sprite TLUTs. Cross-references
+    // SPRITE catalog entries with the file's chain-slot table to reach the
+    // texture bytes that fighter and stage assets store outside the in-DL
+    // path. Without this, mods can override sprite/bitmap *config* (struct
+    // fields) but not the sprite *appearance* (pixel data).
+    std::unordered_map<uint32_t, uint32_t> chainSlotMap;
+    chainSlotMap.reserve(internEntries.size() + externEntries.size());
+    for (const auto& ce : internEntries) chainSlotMap[ce.slot_byte_off] = ce.target_byte_off;
+    for (const auto& ce : externEntries) chainSlotMap[ce.slot_byte_off] = ce.target_byte_off;
+
+    EmitChainPixelBuffers(data, file_id, entryOtrPath, chainSlotMap,
+                          bitmapInCatalog, out);
 
     // Stable sort by (byte_offset, kind) so two extractions of the same ROM
     // produce identical container hash lists. ScanDisplayLists already walks
@@ -933,7 +1086,8 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     // Companion::RegisterCompanionFile on each blob; the entries returned
     // here only carry the hash list for the container header.
     const std::vector<SubResource> subResources =
-        EmitSubResources(data, reloc->mFileId, entryName);
+        EmitSubResources(data, reloc->mFileId, entryName,
+                         internEntries, externEntries);
 
     uint32_t subresFlag = 0;
     if (!subResources.empty()) {
