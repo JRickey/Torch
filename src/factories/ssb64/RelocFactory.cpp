@@ -337,6 +337,17 @@ void ApplyStructU16Fixup(uint8_t* base, uint32_t num_words) {
     }
 }
 
+// Mirrors portFixupStructU32 / portFixupRawTextureBSWAP32 in
+// port/bridge/lbreloc_byteswap.cpp: bswap32 every word in
+// [base, base + num_words*4). Variable-size — extra carries num_words.
+// Same shape between the two runtime helpers; they share the STRUCT_U32
+// catalog family.
+void ApplyStructU32Fixup(uint8_t* base, uint32_t num_words) {
+    for (uint32_t i = 0; i < num_words; i++) {
+        Bswap32Bytes(base + i * 4);
+    }
+}
+
 // Walks the catalog for `file_id`, applies each in-scope family transform to
 // `data` in place, and returns the OR'd PROC_<FAMILY>_DONE bits for the
 // families that were actually touched. `data` must already have pass1+pass2
@@ -373,6 +384,13 @@ uint32_t ApplyStructFixupsInPlace(std::vector<uint8_t>& data, uint32_t file_id) 
             if (e->byte_offset + span > file_size) continue;
             ApplyStructU16Fixup(data.data() + e->byte_offset, e->extra);
             flags_set |= kProcStructU16Done;
+            break;
+        }
+        case SSB64::StructFixupCatalog::STRUCT_U32: {
+            const uint64_t span = uint64_t(e->extra) * 4;
+            if (e->byte_offset + span > file_size) continue;
+            ApplyStructU32Fixup(data.data() + e->byte_offset, e->extra);
+            flags_set |= kProcStructU32Done;
             break;
         }
         // Other families land in subsequent Stage 6d steps.
