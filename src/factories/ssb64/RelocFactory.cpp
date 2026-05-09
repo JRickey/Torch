@@ -2,11 +2,15 @@
 #include "StructFixupCatalogData.h"
 
 #include "Companion.h"
+#include "lib/strhash64/StrHash64.h"
 #include "spdlog/spdlog.h"
 
+#include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <stdexcept>
+#include <string>
 
 extern "C" {
 #include <libvpk0/vpk0.h>
@@ -27,20 +31,26 @@ extern "C" {
 //                                          bit 1 = PROC_PASS2_DONE,
 //                                          bits 2..7 = PROC_<FAMILY>_DONE,
 //                                          bit 8 = PROC_HALFSWAP_DONE,
-//                                          bit 10 = PROC_CHAIN_FLATTENED)
+//                                          bit 10 = PROC_CHAIN_FLATTENED,
+//                                          bit 11 = PROC_SUBRESOURCES_EMITTED)
 //    u32  num_intern_chain_entries  (v2+)
 //    { u32 slot_byte_off, u32 target_byte_off }[num_intern_chain_entries]
 //    u32  num_extern_chain_entries  (v2+)
 //    { u32 slot_byte_off, u32 target_byte_off }[num_extern_chain_entries]
+//    u32  num_sub_resource_hashes   (v3+)
+//    { u64 hash, u32 byte_offset, u32 size, u8 kind, u8[3] pad }[N]  (v3+)
 //    u32  decompressed_data_size   (bytes)
 //    u8[decompressed_data_size]  decompressed_data   // post-Pass1+Pass2 if
 //                                                      both flags set
 //
 //  Header version 1 added processing_flags (Pass1+Pass2+struct+halfswap moved
-//  to torch). Version 2 (current) adds the flat chain-entry sidecar (Stage 9
-//  chain-flatten). The runtime registers V0/V1/V2 factories; older archives
-//  keep loading via the matching factory and run skipped transforms at load
-//  time as before.
+//  to torch). Version 2 added the flat chain-entry sidecar (Stage 9
+//  chain-flatten). Version 3 (current) adds the sub-resource hash list (Stage
+//  10 moddability) — each entry names a Blob resource emitted alongside the
+//  container at "<entryOtrPath>__sub/<kind>/<offset>", whose bytes the runtime
+//  can overlay before chain-walking to support side-loaded mod .o2r files.
+//  The runtime registers V0/V1/V2/V3 factories; older archives keep loading
+//  via the matching factory and run skipped transforms at load time as before.
 //
 // ============================================================================
 
@@ -57,7 +67,39 @@ constexpr uint32_t kProcMobjsubDone      = 1u << 6;
 constexpr uint32_t kProcFtAttributesDone = 1u << 7;
 constexpr uint32_t kProcHalfswapDone     = 1u << 8;
 // Bit 9 reserved-unused (Stage 7 closeout — AObjEvent32 walker stays runtime-side).
-constexpr uint32_t kProcChainFlattened   = 1u << 10;
+constexpr uint32_t kProcChainFlattened     = 1u << 10;
+constexpr uint32_t kProcSubresourcesEmitted = 1u << 11;
+
+// Sub-resource kind tags. Stable u8 values stored in the v3 container header
+// alongside each (hash, byte_offset, size) tuple. The runtime treats them as
+// opaque labels — overlay logic does not switch on them — but the path scheme
+// embeds them so override .o2r authors can target a specific sub-asset by
+// kind/offset. Mirrors port/resource/RelocFile.h::SubResKind.
+enum class SubResKind : uint8_t {
+    Vtx          = 0,
+    Tex          = 1,
+    Tlut         = 2,
+    Sprite       = 3,
+    Bitmap       = 4,
+    MObjSub      = 5,
+    StructU16    = 6,
+    StructU32    = 7,
+    FTAttributes = 8,
+};
+inline const char* SubResKindStr(SubResKind k) {
+    switch (k) {
+    case SubResKind::Vtx:          return "vtx";
+    case SubResKind::Tex:          return "tex";
+    case SubResKind::Tlut:         return "tlut";
+    case SubResKind::Sprite:       return "sprite";
+    case SubResKind::Bitmap:       return "bitmap";
+    case SubResKind::MObjSub:      return "mobjsub";
+    case SubResKind::StructU16:    return "struct_u16";
+    case SubResKind::StructU32:    return "struct_u32";
+    case SubResKind::FTAttributes: return "ftattributes";
+    }
+    return "?";
+}
 
 // F3DEX2 GBI opcode constants. Mirror port/bridge/lbreloc_byteswap.cpp.
 constexpr uint8_t  kGbiVtx        = 0x01;
@@ -95,7 +137,11 @@ uint32_t ReadU32Native(const std::vector<uint8_t>& data, size_t off) {
     return w;
 }
 
-enum class Pass2Kind { Vertex, TexBytes, TexU16 };
+// TexBytes covers 4b/8b images (LoadBlock); TexU16 covers 16b images
+// (LoadBlock); Tlut covers palettes (LoadTlut). The byte transform is the
+// same for the latter two (Bswap32 per word), but they're tagged separately
+// so sub-resource emission can label them distinctly.
+enum class Pass2Kind { Vertex, TexBytes, TexU16, Tlut };
 struct Pass2Region {
     uint32_t  offset;
     uint32_t  size;
@@ -198,7 +244,7 @@ void ScanDisplayLists(const std::vector<uint8_t>& data,
             }
             if (static_cast<size_t>(palette_bytes) > (file_size - pending_offset_sz))
                 palette_bytes = static_cast<uint32_t>(file_size - pending_offset_sz);
-            out.push_back({pending_tex_offset, palette_bytes, Pass2Kind::TexU16});
+            out.push_back({pending_tex_offset, palette_bytes, Pass2Kind::Tlut});
             has_pending_tex = false;
             break;
         }
@@ -551,6 +597,203 @@ void BuildChainEntries(const std::vector<uint8_t>& data,
     walk(reloc_extern, extern_out);
 }
 
+// One sub-resource emitted alongside the container (Stage 10). Records what
+// the runtime needs to find/overlay an override blob: hash of the resource
+// path, byte-offset+size into the post-fixup data block, and a kind tag.
+struct SubResource {
+    uint64_t   hash;
+    uint32_t   byte_offset;
+    uint32_t   size;
+    SubResKind kind;
+};
+
+// Maps a Pass2 region to a sub-resource kind. ScanDisplayLists already
+// distinguishes the four cases at scan time.
+inline SubResKind Pass2KindToSubResKind(Pass2Kind k) {
+    switch (k) {
+    case Pass2Kind::Vertex:   return SubResKind::Vtx;
+    case Pass2Kind::TexBytes: return SubResKind::Tex;
+    case Pass2Kind::TexU16:   return SubResKind::Tex;
+    case Pass2Kind::Tlut:     return SubResKind::Tlut;
+    }
+    return SubResKind::Vtx;
+}
+
+// Maps a struct-fixup catalog entry to a sub-resource kind + byte size.
+// Returns false if the entry isn't a sub-resource we want to emit (defensive
+// — every catalog family today is a sub-resource).
+bool CatalogEntryToSubRes(const SSB64::StructFixupCatalog::Entry& e,
+                          SubResKind& kind_out, uint32_t& size_out) {
+    switch (e.family) {
+    case SSB64::StructFixupCatalog::SPRITE:
+        kind_out = SubResKind::Sprite;       size_out = kSpriteSize;       return true;
+    case SSB64::StructFixupCatalog::BITMAP:
+        kind_out = SubResKind::Bitmap;       size_out = kBitmapSize;       return true;
+    case SSB64::StructFixupCatalog::MOBJSUB:
+        kind_out = SubResKind::MObjSub;      size_out = kMObjSubSize;      return true;
+    case SSB64::StructFixupCatalog::STRUCT_U16:
+        kind_out = SubResKind::StructU16;    size_out = e.extra * 4u;      return true;
+    case SSB64::StructFixupCatalog::STRUCT_U32:
+        kind_out = SubResKind::StructU32;    size_out = e.extra * 4u;      return true;
+    case SSB64::StructFixupCatalog::FTATTRIBUTES:
+        kind_out = SubResKind::FTAttributes; size_out = kFTAttributesSize; return true;
+    }
+    return false;
+}
+
+// Builds an OTR resource path for one sub-resource. The path is a pure
+// function of (entryOtrPath, kind, byte_offset) so override mods stay valid
+// across rebuilds — torch re-extracting the same ROM produces identical
+// hashes for identical sub-assets.
+//
+// `entryOtrPath` is the full prefixed asset path (e.g. "reloc_animations/FTMario").
+// The sub-resource path is "<entryOtrPath>__sub/<kind>/<byte_offset>" — a
+// sibling of the container in the same directory, with a "__sub" suffix on
+// the basename so it doesn't collide with any other asset in the OTR.
+//
+// Decimal byte offset (vs. hex) is intentional: yields canonical paths
+// without case-sensitivity ambiguity, and modders typically know offsets
+// from disassembly listings in either form.
+std::string SubResourceOtrPath(const std::string& entryOtrPath,
+                                SubResKind kind, uint32_t byte_offset) {
+    std::string p;
+    p.reserve(entryOtrPath.size() + 32);
+    p  = entryOtrPath;
+    p += "__sub/";
+    p += SubResKindStr(kind);
+    p += '/';
+    p += std::to_string(byte_offset);
+    return p;
+}
+
+// Companion path is the same path with the gCurrentDirectory prefix stripped
+// — Companion::AddFile re-prefixes it. Just take the basename of entryOtrPath
+// + the suffix, since Companion's writer joins gCurrentDirectory + entry.first.
+std::string SubResourceCompanionPath(const std::string& entryOtrPath,
+                                      SubResKind kind, uint32_t byte_offset) {
+    auto baseName = std::filesystem::path(entryOtrPath).filename().string();
+    std::string p;
+    p.reserve(baseName.size() + 32);
+    p  = baseName;
+    p += "__sub/";
+    p += SubResKindStr(kind);
+    p += '/';
+    p += std::to_string(byte_offset);
+    return p;
+}
+
+// Serializes one sub-resource as a standard LUS Blob — the runtime reads
+// these via the existing ResourceFactoryBinaryBlobV0 (header + u32 size +
+// bytes). The `data` block we slice from is the post-pass1+pass2+struct+
+// halfswap buffer, so a freshly-extracted sub-resource is byte-identical
+// to the corresponding region in the container — overlay logic at runtime
+// can early-out on equal bytes.
+std::vector<char> BuildSubResourceBlob(const std::vector<uint8_t>& data,
+                                        uint32_t byte_offset, uint32_t size) {
+    LUS::BinaryWriter blobWriter;
+    BaseExporter::WriteHeader(blobWriter, Torch::ResourceType::Blob, 0);
+    blobWriter.Write(size);
+    if (size > 0) {
+        blobWriter.Write(reinterpret_cast<char*>(const_cast<uint8_t*>(data.data())) + byte_offset,
+                         size);
+    }
+    return blobWriter.ToVector();
+}
+
+// Walks `data` (post all transforms) plus the struct catalog and emits one
+// SubResource per Vtx run / texture image / palette / fixed-up struct. The
+// path is computed via SubResourceOtrPath; the bytes are registered with
+// Companion as a sibling resource. Returns the list (sorted by byte_offset
+// for stability) so the container header can record (hash, off, size, kind)
+// for each.
+//
+// Bounds checks are defensive — every region returned by ScanDisplayLists
+// or present in the catalog has already been bounds-checked against
+// `file_size` in the helpers that produced it. The duplicate check here is
+// belt-and-suspenders.
+//
+// AObjEvent32 anim heads are intentionally NOT emitted. Per the Stage 7
+// closeout ADR (decision_aobjevent32_runtime_walker_2026-05-09.md), the
+// runtime walker stays permanently — modders don't author through that
+// stream and there's no enumerator for it at extraction time.
+std::vector<SubResource>
+EmitSubResources(const std::vector<uint8_t>& data,
+                 uint32_t file_id,
+                 const std::string& entryOtrPath) {
+    std::vector<SubResource> out;
+    const size_t file_size = data.size();
+    if (file_size == 0) return out;
+
+    // (a) Pass 2 regions — vtx, tex_bytes, tex_u16, tlut.
+    std::vector<Pass2Region> regions;
+    ScanDisplayLists(data, regions);
+    for (const auto& r : regions) {
+        if (r.size == 0) continue;
+        if (static_cast<size_t>(r.offset) > file_size) continue;
+        if (static_cast<size_t>(r.size) > (file_size - r.offset)) continue;
+        const SubResKind kind = Pass2KindToSubResKind(r.kind);
+        SubResource sr{};
+        sr.byte_offset = r.offset;
+        sr.size        = r.size;
+        sr.kind        = kind;
+        sr.hash        = CRC64(SubResourceOtrPath(entryOtrPath, kind, r.offset).c_str());
+        out.push_back(sr);
+    }
+
+    // (b) Catalog entries — sprite, bitmap, mobjsub, struct_u16, struct_u32, ftattributes.
+    auto [first, last] = SSB64::StructFixupCatalog::EntriesForFile(
+        static_cast<uint16_t>(file_id));
+    for (const auto* e = first; e != last; ++e) {
+        SubResKind kind;
+        uint32_t   size = 0;
+        if (!CatalogEntryToSubRes(*e, kind, size)) continue;
+        if (size == 0) continue;
+        if (static_cast<size_t>(e->byte_offset) > file_size) continue;
+        if (static_cast<size_t>(size) > (file_size - e->byte_offset)) continue;
+        SubResource sr{};
+        sr.byte_offset = e->byte_offset;
+        sr.size        = size;
+        sr.kind        = kind;
+        sr.hash        = CRC64(SubResourceOtrPath(entryOtrPath, kind, e->byte_offset).c_str());
+        out.push_back(sr);
+    }
+
+    // Stable sort by (byte_offset, kind) so two extractions of the same ROM
+    // produce identical container hash lists. ScanDisplayLists already walks
+    // the DL stream in deterministic order, but multiple G_VTX regions can
+    // share an offset (if a DL re-loads the same Vtx run with a different
+    // count); group them in offset order to keep diffs reviewable.
+    std::stable_sort(out.begin(), out.end(),
+                     [](const SubResource& a, const SubResource& b) {
+                         if (a.byte_offset != b.byte_offset) return a.byte_offset < b.byte_offset;
+                         return static_cast<uint8_t>(a.kind) < static_cast<uint8_t>(b.kind);
+                     });
+
+    // Dedup by (byte_offset, kind, size). A given (offset, kind) is allowed
+    // to appear twice in the regions list (e.g. two G_VTX commands referencing
+    // the same Vtx run), but only one sub-resource needs to exist for it.
+    out.erase(std::unique(out.begin(), out.end(),
+                          [](const SubResource& a, const SubResource& b) {
+                              return a.byte_offset == b.byte_offset
+                                  && a.kind == b.kind
+                                  && a.size == b.size;
+                          }),
+              out.end());
+
+    // Register each blob as a companion file alongside the container in the
+    // OTR. Companion::Process re-prefixes companion paths with
+    // gCurrentDirectory; SubResourceCompanionPath strips that prefix so the
+    // round-trip lands at SubResourceOtrPath in the archive.
+    for (const auto& sr : out) {
+        auto blobBytes = BuildSubResourceBlob(data, sr.byte_offset, sr.size);
+        Companion::Instance->RegisterCompanionFile(
+            SubResourceCompanionPath(entryOtrPath, sr.kind, sr.byte_offset),
+            std::move(blobBytes));
+    }
+
+    return out;
+}
+
 // Applies the pass2 byte transforms in place. Idempotent in the sense that
 // re-running it on already-pass2'd data would produce a different blob (it
 // would invert the transforms again); torch invokes it exactly once per file
@@ -582,6 +825,7 @@ void ApplyPass2InPlace(std::vector<uint8_t>& data) {
         case Pass2Kind::Vertex:   ApplyVertexFixup(region_base, aligned);   break;
         case Pass2Kind::TexBytes: ApplyBswap32Region(region_base, aligned); break;
         case Pass2Kind::TexU16:   ApplyBswap32Region(region_base, aligned); break;
+        case Pass2Kind::Tlut:     ApplyBswap32Region(region_base, aligned); break;
         }
     }
 }
@@ -654,8 +898,8 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     auto reloc = std::static_pointer_cast<SSB64::RelocData>(raw);
     auto writer = LUS::BinaryWriter();
 
-    // v2: adds a flat chain-entry sidecar (Stage 9).
-    WriteHeader(writer, Torch::ResourceType::SSB64Reloc, 2);
+    // v3: adds the sub-resource hash list (Stage 10 moddability).
+    WriteHeader(writer, Torch::ResourceType::SSB64Reloc, 3);
 
     writer.Write(reloc->mFileId);
     writer.Write(reloc->mRelocInternOffset);
@@ -681,9 +925,24 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     BuildChainEntries(data, reloc->mRelocInternOffset, reloc->mRelocExternOffset,
                       internEntries, externEntries);
 
+    // Enumerate sub-resources and register companion blobs alongside the
+    // container in the OTR. Each sub-resource is independently loadable by
+    // the runtime via CRC64(path); a side-loaded mod .o2r whose
+    // last-archive-wins resolution claims the same hash overrides the bytes
+    // before chain-walk. EmitSubResources also calls
+    // Companion::RegisterCompanionFile on each blob; the entries returned
+    // here only carry the hash list for the container header.
+    const std::vector<SubResource> subResources =
+        EmitSubResources(data, reloc->mFileId, entryName);
+
+    uint32_t subresFlag = 0;
+    if (!subResources.empty()) {
+        subresFlag = kProcSubresourcesEmitted;
+    }
+
     const uint32_t processingFlags =
         kProcPass1BswapDone | kProcPass2Done | structFlags | halfswapFlags |
-        kProcChainFlattened;
+        kProcChainFlattened | subresFlag;
 
     writer.Write(processingFlags);
 
@@ -696,6 +955,17 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     for (const auto& e : externEntries) {
         writer.Write(e.slot_byte_off);
         writer.Write(e.target_byte_off);
+    }
+
+    writer.Write((uint32_t)subResources.size());
+    for (const auto& sr : subResources) {
+        writer.Write((uint64_t)sr.hash);
+        writer.Write((uint32_t)sr.byte_offset);
+        writer.Write((uint32_t)sr.size);
+        writer.Write((uint8_t)static_cast<uint8_t>(sr.kind));
+        writer.Write((uint8_t)0);   // pad[0]
+        writer.Write((uint8_t)0);   // pad[1]
+        writer.Write((uint8_t)0);   // pad[2]
     }
 
     writer.Write((uint32_t)data.size());
