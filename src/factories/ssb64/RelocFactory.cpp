@@ -24,7 +24,9 @@ extern "C" {
 //    u32  num_extern_file_ids
 //    u16[num_extern_file_ids]  extern_file_ids
 //    u32  processing_flags         (v1+; bit 0 = PROC_PASS1_BSWAP_DONE,
-//                                          bit 1 = PROC_PASS2_DONE)
+//                                          bit 1 = PROC_PASS2_DONE,
+//                                          bits 2..7 = PROC_<FAMILY>_DONE,
+//                                          bit 8 = PROC_HALFSWAP_DONE)
 //    u32  decompressed_data_size   (bytes)
 //    u8[decompressed_data_size]  decompressed_data   // post-Pass1+Pass2 if
 //                                                      both flags set
@@ -46,6 +48,7 @@ constexpr uint32_t kProcSpriteDone       = 1u << 4;
 constexpr uint32_t kProcBitmapDone       = 1u << 5;
 constexpr uint32_t kProcMobjsubDone      = 1u << 6;
 constexpr uint32_t kProcFtAttributesDone = 1u << 7;
+constexpr uint32_t kProcHalfswapDone     = 1u << 8;
 
 // F3DEX2 GBI opcode constants. Mirror port/bridge/lbreloc_byteswap.cpp.
 constexpr uint8_t  kGbiVtx        = 0x01;
@@ -433,6 +436,69 @@ uint32_t ApplyStructFixupsInPlace(std::vector<uint8_t>& data, uint32_t file_id) 
     return flags_set;
 }
 
+// Mirrors portRelocIsFighterFigatreeFile in port/bridge/lbreloc_bridge.cpp.
+// The runtime u16-halfswap was applied to fighter animation/submotion files
+// (because their figatree/AObjEvent16 streams encode u16 pairs in u32 slots,
+// and pass1 BSWAP32 alone leaves the pair indices reversed under LE), and to
+// SCExplainMain (FTKeyEvent u16 arrays + SCExplainPhase u16/u8 fields).
+bool PathNeedsHalfswap(const std::string& path) {
+    static const std::string kAnimPrefix      = "reloc_animations/FT";
+    static const std::string kSubmotionPrefix = "reloc_submotions/FT";
+    static const std::string kSCExplainMain   = "reloc_scene/SCExplainMain";
+    if (path.compare(0, kAnimPrefix.size(),      kAnimPrefix)      == 0) return true;
+    if (path.compare(0, kSubmotionPrefix.size(), kSubmotionPrefix) == 0) return true;
+    if (path == kSCExplainMain) return true;
+    return false;
+}
+
+// Mirrors portRelocFixupFighterFigatree in port/bridge/lbreloc_bridge.cpp:
+// rotate16 every u32 word that is NOT a reloc-chain slot. Chain slots (intern
+// + extern lists) hold encoded `next_reloc:16 | target:16` linked-list nodes
+// that the runtime later overwrites with tokens; the runtime mask zeroes them
+// out before halfswap so they read as native u32 (`*slot >> 16` etc) for the
+// chain walk. Torch precomputes the same mask by walking both chains in the
+// post-pass1+pass2+struct buffer.
+//
+// `path` is the OTR path string (== entryName at this layer). When it doesn't
+// match the runtime's halfswap predicate, returns 0 with no transform applied.
+uint32_t ApplyHalfswapInPlace(std::vector<uint8_t>& data,
+                              uint16_t reloc_intern,
+                              uint16_t reloc_extern,
+                              const std::string& path) {
+    if (!PathNeedsHalfswap(path)) return 0;
+
+    const size_t word_count = data.size() / 4;
+    if (word_count == 0) return 0;
+
+    std::vector<uint8_t> reloc_mask(word_count, 0);
+
+    auto walk_chain = [&](uint16_t start) {
+        // 0xFFFF = sentinel (no chain). Defensive iteration cap matches the
+        // runtime's implicit guarantee — the chain has at most word_count
+        // distinct nodes, so any longer walk indicates a cycle / corrupt data.
+        uint16_t cur = start;
+        size_t   iter = 0;
+        while (cur != 0xFFFF && iter < word_count) {
+            if (static_cast<size_t>(cur) >= word_count) break;
+            reloc_mask[cur] = 1;
+            const uint32_t w = ReadU32Native(data, static_cast<size_t>(cur) * 4);
+            cur = static_cast<uint16_t>(w >> 16);
+            iter++;
+        }
+    };
+
+    walk_chain(reloc_intern);
+    walk_chain(reloc_extern);
+
+    uint8_t* bytes = data.data();
+    for (size_t i = 0; i < word_count; i++) {
+        if (!reloc_mask[i]) {
+            Rotate16Bytes(bytes + i * 4);
+        }
+    }
+    return kProcHalfswapDone;
+}
+
 // Applies the pass2 byte transforms in place. Idempotent in the sense that
 // re-running it on already-pass2'd data would produce a different blob (it
 // would invert the transforms again); torch invokes it exactly once per file
@@ -552,8 +618,10 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     ApplyPass1BswapInPlace(data);
     ApplyPass2InPlace(data);
     const uint32_t structFlags = ApplyStructFixupsInPlace(data, reloc->mFileId);
+    const uint32_t halfswapFlags = ApplyHalfswapInPlace(
+        data, reloc->mRelocInternOffset, reloc->mRelocExternOffset, entryName);
     const uint32_t processingFlags =
-        kProcPass1BswapDone | kProcPass2Done | structFlags;
+        kProcPass1BswapDone | kProcPass2Done | structFlags | halfswapFlags;
 
     writer.Write(processingFlags);
     writer.Write((uint32_t)data.size());
