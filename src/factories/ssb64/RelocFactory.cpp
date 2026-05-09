@@ -1,4 +1,5 @@
 #include "RelocFactory.h"
+#include "StructFixupCatalogData.h"
 
 #include "Companion.h"
 #include "spdlog/spdlog.h"
@@ -39,6 +40,12 @@ namespace {
 // Mirrors port/resource/RelocFile.h.
 constexpr uint32_t kProcPass1BswapDone = 1u << 0;
 constexpr uint32_t kProcPass2Done      = 1u << 1;
+constexpr uint32_t kProcStructU16Done    = 1u << 2;
+constexpr uint32_t kProcStructU32Done    = 1u << 3;
+constexpr uint32_t kProcSpriteDone       = 1u << 4;
+constexpr uint32_t kProcBitmapDone       = 1u << 5;
+constexpr uint32_t kProcMobjsubDone      = 1u << 6;
+constexpr uint32_t kProcFtAttributesDone = 1u << 7;
 
 // F3DEX2 GBI opcode constants. Mirror port/bridge/lbreloc_byteswap.cpp.
 constexpr uint8_t  kGbiVtx        = 0x01;
@@ -225,6 +232,67 @@ void ApplyBswap32Region(uint8_t* base, uint32_t aligned_bytes) {
     }
 }
 
+// Mirrors portFixupSprite in port/bridge/lbreloc_byteswap.cpp.
+// Sprite layout (17 words = 68 bytes):
+//   w[0]  rotate16  s16 x, s16 y
+//   w[1]  rotate16  s16 width, s16 height
+//   w[2]  ok        f32 scalex
+//   w[3]  ok        f32 scaley
+//   w[4]  rotate16  s16 expx, s16 expy
+//   w[5]  rotate16  u16 attr, s16 zdepth
+//   w[6]  bswap32   u8 rgba
+//   w[7]  rotate16  s16 startTLUT, s16 nTLUT
+//   w[8]  ok        u32 LUT (token)
+//   w[9]  rotate16  s16 istart, s16 istep
+//   w[10] rotate16  s16 nbitmaps, s16 ndisplist
+//   w[11] rotate16  s16 bmheight, s16 bmHreal
+//   w[12] bswap32   u8 bmfmt, u8 bmsiz, pad
+//   w[13] ok        u32 bitmap (token)
+//   w[14] ok        u32 rsp_dl (token)
+//   w[15] ok        u32 rsp_dl_next (token)
+//   w[16] rotate16  s16 frac_s, s16 frac_t
+void ApplySpriteFixup(uint8_t* base) {
+    Rotate16Bytes(base + 0  * 4);
+    Rotate16Bytes(base + 1  * 4);
+    Rotate16Bytes(base + 4  * 4);
+    Rotate16Bytes(base + 5  * 4);
+    Bswap32Bytes (base + 6  * 4);
+    Rotate16Bytes(base + 7  * 4);
+    Rotate16Bytes(base + 9  * 4);
+    Rotate16Bytes(base + 10 * 4);
+    Rotate16Bytes(base + 11 * 4);
+    Bswap32Bytes (base + 12 * 4);
+    Rotate16Bytes(base + 16 * 4);
+}
+constexpr uint32_t kSpriteSize = 68;
+
+// Walks the catalog for `file_id`, applies each in-scope family transform to
+// `data` in place, and returns the OR'd PROC_<FAMILY>_DONE bits for the
+// families that were actually touched. `data` must already have pass1+pass2
+// applied — struct fixups expect that as their input state.
+uint32_t ApplyStructFixupsInPlace(std::vector<uint8_t>& data, uint32_t file_id) {
+    uint32_t flags_set = 0;
+    auto [first, last] = SSB64::StructFixupCatalog::EntriesForFile(
+        static_cast<uint16_t>(file_id));
+    if (first == last) return 0;
+
+    const size_t file_size = data.size();
+    for (const auto* e = first; e != last; ++e) {
+        switch (e->family) {
+        case SSB64::StructFixupCatalog::SPRITE: {
+            if (e->byte_offset + kSpriteSize > file_size) continue;
+            ApplySpriteFixup(data.data() + e->byte_offset);
+            flags_set |= kProcSpriteDone;
+            break;
+        }
+        // Other families land in subsequent Stage 6d steps.
+        default:
+            break;
+        }
+    }
+    return flags_set;
+}
+
 // Applies the pass2 byte transforms in place. Idempotent in the sense that
 // re-running it on already-pass2'd data would produce a different blob (it
 // would invert the transforms again); torch invokes it exactly once per file
@@ -343,7 +411,9 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     std::vector<uint8_t> data = reloc->mDecompressedData;
     ApplyPass1BswapInPlace(data);
     ApplyPass2InPlace(data);
-    const uint32_t processingFlags = kProcPass1BswapDone | kProcPass2Done;
+    const uint32_t structFlags = ApplyStructFixupsInPlace(data, reloc->mFileId);
+    const uint32_t processingFlags =
+        kProcPass1BswapDone | kProcPass2Done | structFlags;
 
     writer.Write(processingFlags);
     writer.Write((uint32_t)data.size());
