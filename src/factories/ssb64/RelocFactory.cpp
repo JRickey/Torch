@@ -328,6 +328,15 @@ void ApplyMObjSubFixup(uint8_t* base) {
 }
 constexpr uint32_t kMObjSubSize = 120;
 
+// Mirrors portFixupStructU16 in port/bridge/lbreloc_byteswap.cpp:
+// rotate16 every word in [base, base + num_words*4). Variable-size — caller
+// (i.e. each catalog entry) carries num_words in the catalog's `extra` field.
+void ApplyStructU16Fixup(uint8_t* base, uint32_t num_words) {
+    for (uint32_t i = 0; i < num_words; i++) {
+        Rotate16Bytes(base + i * 4);
+    }
+}
+
 // Walks the catalog for `file_id`, applies each in-scope family transform to
 // `data` in place, and returns the OR'd PROC_<FAMILY>_DONE bits for the
 // families that were actually touched. `data` must already have pass1+pass2
@@ -357,6 +366,13 @@ uint32_t ApplyStructFixupsInPlace(std::vector<uint8_t>& data, uint32_t file_id) 
             if (e->byte_offset + kMObjSubSize > file_size) continue;
             ApplyMObjSubFixup(data.data() + e->byte_offset);
             flags_set |= kProcMobjsubDone;
+            break;
+        }
+        case SSB64::StructFixupCatalog::STRUCT_U16: {
+            const uint64_t span = uint64_t(e->extra) * 4;
+            if (e->byte_offset + span > file_size) continue;
+            ApplyStructU16Fixup(data.data() + e->byte_offset, e->extra);
+            flags_set |= kProcStructU16Done;
             break;
         }
         // Other families land in subsequent Stage 6d steps.
