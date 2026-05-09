@@ -266,6 +266,19 @@ void ApplySpriteFixup(uint8_t* base) {
 }
 constexpr uint32_t kSpriteSize = 68;
 
+// Mirrors portFixupBitmap in port/bridge/lbreloc_byteswap.cpp.
+// Bitmap layout (4 words = 16 bytes):
+//   w[0] rotate16  s16 width, s16 width_img
+//   w[1] rotate16  s16 s, s16 t
+//   w[2] ok        u32 buf (token)
+//   w[3] rotate16  s16 actualHeight, s16 LUToffset
+void ApplyBitmapFixup(uint8_t* base) {
+    Rotate16Bytes(base + 0 * 4);
+    Rotate16Bytes(base + 1 * 4);
+    Rotate16Bytes(base + 3 * 4);
+}
+constexpr uint32_t kBitmapSize = 16;
+
 // Walks the catalog for `file_id`, applies each in-scope family transform to
 // `data` in place, and returns the OR'd PROC_<FAMILY>_DONE bits for the
 // families that were actually touched. `data` must already have pass1+pass2
@@ -283,6 +296,12 @@ uint32_t ApplyStructFixupsInPlace(std::vector<uint8_t>& data, uint32_t file_id) 
             if (e->byte_offset + kSpriteSize > file_size) continue;
             ApplySpriteFixup(data.data() + e->byte_offset);
             flags_set |= kProcSpriteDone;
+            break;
+        }
+        case SSB64::StructFixupCatalog::BITMAP: {
+            if (e->byte_offset + kBitmapSize > file_size) continue;
+            ApplyBitmapFixup(data.data() + e->byte_offset);
+            flags_set |= kProcBitmapDone;
             break;
         }
         // Other families land in subsequent Stage 6d steps.
