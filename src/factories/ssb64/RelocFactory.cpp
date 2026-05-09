@@ -3,6 +3,7 @@
 #include "Companion.h"
 #include "spdlog/spdlog.h"
 
+#include <cstring>
 #include <iomanip>
 #include <stdexcept>
 
@@ -21,9 +22,11 @@ extern "C" {
 //    u16  reloc_extern_offset      (word offset, 0xFFFF = none)
 //    u32  num_extern_file_ids
 //    u16[num_extern_file_ids]  extern_file_ids
-//    u32  processing_flags         (v1+; bit 0 = PROC_PASS1_BSWAP_DONE)
+//    u32  processing_flags         (v1+; bit 0 = PROC_PASS1_BSWAP_DONE,
+//                                          bit 1 = PROC_PASS2_DONE)
 //    u32  decompressed_data_size   (bytes)
-//    u8[decompressed_data_size]  decompressed_data   // post-Pass1 if flag set
+//    u8[decompressed_data_size]  decompressed_data   // post-Pass1+Pass2 if
+//                                                      both flags set
 //
 //  Header version is bumped to 1 because the runtime (port/resource) registers
 //  a separate V1 factory; v0 archives without `processing_flags` keep loading
@@ -33,8 +36,20 @@ extern "C" {
 
 namespace {
 
-// Mirrors port/resource/RelocFile.h: PROC_PASS1_BSWAP_DONE.
+// Mirrors port/resource/RelocFile.h.
 constexpr uint32_t kProcPass1BswapDone = 1u << 0;
+constexpr uint32_t kProcPass2Done      = 1u << 1;
+
+// F3DEX2 GBI opcode constants. Mirror port/bridge/lbreloc_byteswap.cpp.
+constexpr uint8_t  kGbiVtx        = 0x01;
+constexpr uint8_t  kGbiSettimg    = 0xFD;
+constexpr uint8_t  kGbiLoadblock  = 0xF3;
+constexpr uint8_t  kGbiLoadtlut   = 0xF0;
+constexpr uint8_t  kFileSegmentId = 0x0E;
+constexpr uint32_t kImSiz4b  = 0;
+constexpr uint32_t kImSiz8b  = 1;
+constexpr uint32_t kImSiz16b = 2;
+constexpr uint32_t kImSiz32b = 3;
 
 // Reverses each 4-byte group in `data` so a u32 read on a LE host produces
 // the same numerical value as the original BE u32 from N64 ROM. Equivalent
@@ -48,6 +63,200 @@ void ApplyPass1BswapInPlace(std::vector<uint8_t>& data) {
     for (size_t i = 0; i + 4 <= data.size(); i += 4) {
         std::swap(data[i + 0], data[i + 3]);
         std::swap(data[i + 1], data[i + 2]);
+    }
+}
+
+// Reads a u32 from `data[off..off+4]` in host native byte order. Used by the
+// pass2 DL walker — after pass1, `data` holds bytes that read as the original
+// N64 BE u32 numerical value when interpreted natively, regardless of host
+// endian.
+uint32_t ReadU32Native(const std::vector<uint8_t>& data, size_t off) {
+    uint32_t w;
+    std::memcpy(&w, data.data() + off, 4);
+    return w;
+}
+
+enum class Pass2Kind { Vertex, TexBytes, TexU16 };
+struct Pass2Region {
+    uint32_t  offset;
+    uint32_t  size;
+    Pass2Kind kind;
+};
+
+// Walks the post-pass1 blob looking for G_VTX, G_SETTIMG+G_LOADBLOCK, and
+// G_SETTIMG+G_LOADTLUT command pairs whose target segment is 0x0E (intra-file).
+// Pure scanner; no transforms. Mirrors `scan_display_lists` in
+// port/bridge/lbreloc_byteswap.cpp byte-for-byte so the regions list it
+// produces is identical to what the runtime would compute on the same blob.
+void ScanDisplayLists(const std::vector<uint8_t>& data,
+                      std::vector<Pass2Region>& out) {
+    const size_t file_size = data.size();
+    if (file_size < 8) return;
+
+    bool     has_pending_tex     = false;
+    uint32_t pending_tex_offset  = 0;
+    uint32_t pending_tex_siz     = 0;
+
+    for (size_t i = 0; i + 8 <= file_size; i += 8) {
+        const uint32_t w0     = ReadU32Native(data, i);
+        const uint32_t w1     = ReadU32Native(data, i + 4);
+        const uint8_t  opcode = (w0 >> 24) & 0xFF;
+
+        switch (opcode) {
+        case kGbiVtx: {
+            const uint32_t num_vtx   = (w0 >> 12) & 0xFF;
+            const uint8_t  seg       = (w1 >> 24) & 0xFF;
+            const uint32_t offset    = w1 & 0x00FFFFFF;
+            const size_t   offset_sz = static_cast<size_t>(offset);
+            const size_t   vtx_bytes = static_cast<size_t>(num_vtx) * 16;
+            if (seg == kFileSegmentId && num_vtx > 0
+                && offset_sz <= file_size && vtx_bytes <= (file_size - offset_sz)) {
+                out.push_back({offset, num_vtx * 16u, Pass2Kind::Vertex});
+            }
+            break;
+        }
+        case kGbiSettimg: {
+            const uint8_t  seg = (w1 >> 24) & 0xFF;
+            const uint32_t siz = (w0 >> 19) & 0x03;
+            if (seg == kFileSegmentId) {
+                pending_tex_offset = w1 & 0x00FFFFFF;
+                pending_tex_siz    = siz;
+                has_pending_tex    = true;
+            } else {
+                has_pending_tex = false;
+            }
+            break;
+        }
+        case kGbiLoadblock: {
+            if (!has_pending_tex) break;
+            const uint32_t lrs        = (w1 >> 12) & 0xFFF;
+            const uint32_t num_texels = lrs + 1;
+            uint32_t bpp = 0;
+            switch (pending_tex_siz) {
+            case kImSiz4b:  bpp = 4;  break;
+            case kImSiz8b:  bpp = 8;  break;
+            case kImSiz16b: bpp = 16; break;
+            case kImSiz32b: bpp = 32; break;
+            }
+            if (bpp == 0) { has_pending_tex = false; break; }
+            uint32_t tex_bytes = (num_texels * bpp + 7) / 8;
+            tex_bytes = (tex_bytes + 3) & ~3u;
+            const size_t pending_offset_sz = static_cast<size_t>(pending_tex_offset);
+            if (pending_offset_sz > file_size) {
+                has_pending_tex = false;
+                break;
+            }
+            if (static_cast<size_t>(tex_bytes) > (file_size - pending_offset_sz))
+                tex_bytes = static_cast<uint32_t>(file_size - pending_offset_sz);
+
+            Pass2Kind kind;
+            switch (pending_tex_siz) {
+            case kImSiz4b:
+            case kImSiz8b:
+                kind = Pass2Kind::TexBytes;
+                break;
+            case kImSiz16b:
+                kind = Pass2Kind::TexU16;
+                break;
+            default:
+                // 32bpp: pass1's u32 swap is already correct.
+                has_pending_tex = false;
+                continue;
+            }
+            out.push_back({pending_tex_offset, tex_bytes, kind});
+            has_pending_tex = false;
+            break;
+        }
+        case kGbiLoadtlut: {
+            if (!has_pending_tex) break;
+            const uint32_t count = ((w1 >> 14) & 0x3FF) + 1;
+            uint32_t palette_bytes = count * 2;
+            palette_bytes = (palette_bytes + 3) & ~3u;
+            const size_t pending_offset_sz = static_cast<size_t>(pending_tex_offset);
+            if (pending_offset_sz > file_size) {
+                has_pending_tex = false;
+                break;
+            }
+            if (static_cast<size_t>(palette_bytes) > (file_size - pending_offset_sz))
+                palette_bytes = static_cast<uint32_t>(file_size - pending_offset_sz);
+            out.push_back({pending_tex_offset, palette_bytes, Pass2Kind::TexU16});
+            has_pending_tex = false;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+// Rotate-16 in byte form: [d0 d1 d2 d3] -> [d2 d3 d0 d1]. Equivalent on a LE
+// host to `(w << 16) | (w >> 16)` over the u32 reading the 4 bytes natively.
+inline void Rotate16Bytes(uint8_t* p) {
+    std::swap(p[0], p[2]);
+    std::swap(p[1], p[3]);
+}
+
+// Reverse 4 bytes: [d0 d1 d2 d3] -> [d3 d2 d1 d0]. Equivalent to BSWAP32 over
+// the u32 reading the 4 bytes natively.
+inline void Bswap32Bytes(uint8_t* p) {
+    std::swap(p[0], p[3]);
+    std::swap(p[1], p[2]);
+}
+
+// Mirrors apply_fixup_vertex in port/bridge/lbreloc_byteswap.cpp:
+//   word 0..2: rotate16  (s16 ob[0..2], u16 flag, s16 tc[0..1])
+//   word 3:    BSWAP32   (u8 RGBA color)
+void ApplyVertexFixup(uint8_t* base, uint32_t aligned_bytes) {
+    for (uint32_t v = 0; v + 16 <= aligned_bytes; v += 16) {
+        Rotate16Bytes(base + v + 0);
+        Rotate16Bytes(base + v + 4);
+        Rotate16Bytes(base + v + 8);
+        Bswap32Bytes (base + v + 12);
+    }
+}
+
+// Mirrors apply_fixup_tex_bytes / apply_fixup_tex_u16 in
+// port/bridge/lbreloc_byteswap.cpp — both are BSWAP32 per u32 word, undoing
+// pass1's blanket swap so the format-specific texel reads in Fast3D get the
+// original N64 BE byte layout.
+void ApplyBswap32Region(uint8_t* base, uint32_t aligned_bytes) {
+    for (uint32_t i = 0; i + 4 <= aligned_bytes; i += 4) {
+        Bswap32Bytes(base + i);
+    }
+}
+
+// Applies the pass2 byte transforms in place. Idempotent in the sense that
+// re-running it on already-pass2'd data would produce a different blob (it
+// would invert the transforms again); torch invokes it exactly once per file
+// after pass1.
+//
+// Tracker bookkeeping (sStructU16Fixups vertex insertions in the runtime) is
+// NOT done here — that's heap-absolute state which lives only at runtime. The
+// bridge re-walks the same DL stream at load and inserts the trackers
+// regardless of whether torch already applied the byte transforms.
+void ApplyPass2InPlace(std::vector<uint8_t>& data) {
+    std::vector<Pass2Region> regions;
+    ScanDisplayLists(data, regions);
+    if (regions.empty()) return;
+
+    const size_t file_size = data.size();
+    uint8_t* bytes = data.data();
+
+    for (const auto& r : regions) {
+        const size_t start = static_cast<size_t>(r.offset);
+        size_t       len   = static_cast<size_t>(r.size);
+        if (start > file_size || len > (file_size - start)) continue;
+        if ((start & 3) != 0) continue;
+        len &= ~static_cast<size_t>(3);
+        if (len == 0) continue;
+
+        uint8_t* region_base = bytes + start;
+        const uint32_t aligned = static_cast<uint32_t>(len);
+        switch (r.kind) {
+        case Pass2Kind::Vertex:   ApplyVertexFixup(region_base, aligned);   break;
+        case Pass2Kind::TexBytes: ApplyBswap32Region(region_base, aligned); break;
+        case Pass2Kind::TexU16:   ApplyBswap32Region(region_base, aligned); break;
+        }
     }
 }
 
@@ -133,7 +342,8 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
 
     std::vector<uint8_t> data = reloc->mDecompressedData;
     ApplyPass1BswapInPlace(data);
-    const uint32_t processingFlags = kProcPass1BswapDone;
+    ApplyPass2InPlace(data);
+    const uint32_t processingFlags = kProcPass1BswapDone | kProcPass2Done;
 
     writer.Write(processingFlags);
     writer.Write((uint32_t)data.size());
