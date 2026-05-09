@@ -21,10 +21,37 @@ extern "C" {
 //    u16  reloc_extern_offset      (word offset, 0xFFFF = none)
 //    u32  num_extern_file_ids
 //    u16[num_extern_file_ids]  extern_file_ids
+//    u32  processing_flags         (v1+; bit 0 = PROC_PASS1_BSWAP_DONE)
 //    u32  decompressed_data_size   (bytes)
-//    u8[decompressed_data_size]  decompressed_data
+//    u8[decompressed_data_size]  decompressed_data   // post-Pass1 if flag set
+//
+//  Header version is bumped to 1 because the runtime (port/resource) registers
+//  a separate V1 factory; v0 archives without `processing_flags` keep loading
+//  via the V0 factory and run every transform at runtime as before.
 //
 // ============================================================================
+
+namespace {
+
+// Mirrors port/resource/RelocFile.h: PROC_PASS1_BSWAP_DONE.
+constexpr uint32_t kProcPass1BswapDone = 1u << 0;
+
+// Reverses each 4-byte group in `data` so a u32 read on a LE host produces
+// the same numerical value as the original BE u32 from N64 ROM. Equivalent
+// to running pass1_swap_u32 (port/bridge/lbreloc_byteswap.cpp) on the buffer
+// once it lives in PC RAM, but applied at extraction so the runtime can
+// memcpy + skip Pass 1.
+//
+// Endian-portable: works regardless of host byte order. Trailing 1-3 bytes
+// (size % 4) stay untouched, mirroring the runtime's `size / 4` word loop.
+void ApplyPass1BswapInPlace(std::vector<uint8_t>& data) {
+    for (size_t i = 0; i + 4 <= data.size(); i += 4) {
+        std::swap(data[i + 0], data[i + 3]);
+        std::swap(data[i + 1], data[i + 2]);
+    }
+}
+
+} // namespace
 
 // ----------------------------------------------------------------------------
 //  Header exporter (generates C header declarations / OTR path strings)
@@ -92,7 +119,8 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     auto reloc = std::static_pointer_cast<SSB64::RelocData>(raw);
     auto writer = LUS::BinaryWriter();
 
-    WriteHeader(writer, Torch::ResourceType::SSB64Reloc, 0);
+    // v1: post-Pass1 bytes + processing_flags advertise the transform.
+    WriteHeader(writer, Torch::ResourceType::SSB64Reloc, 1);
 
     writer.Write(reloc->mFileId);
     writer.Write(reloc->mRelocInternOffset);
@@ -103,9 +131,13 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
         writer.Write(id);
     }
 
-    writer.Write((uint32_t)reloc->mDecompressedData.size());
-    writer.Write((char*)reloc->mDecompressedData.data(),
-                 reloc->mDecompressedData.size());
+    std::vector<uint8_t> data = reloc->mDecompressedData;
+    ApplyPass1BswapInPlace(data);
+    const uint32_t processingFlags = kProcPass1BswapDone;
+
+    writer.Write(processingFlags);
+    writer.Write((uint32_t)data.size());
+    writer.Write((char*)data.data(), data.size());
 
     writer.Finish(write);
     return std::nullopt;
