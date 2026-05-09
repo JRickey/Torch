@@ -279,6 +279,55 @@ void ApplyBitmapFixup(uint8_t* base) {
 }
 constexpr uint32_t kBitmapSize = 16;
 
+// Mirrors fixup_u16_u8u8 in port/bridge/lbreloc_byteswap.cpp. Permutes a
+// 4-byte word laid out as [u16 a][u8 b][u8 c] in original BE memory:
+//   post-pass1 bytes: [c, b, a_lo, a_hi]  (BSWAP32 of [a_hi, a_lo, b, c])
+//   target LE layout: [a_lo, a_hi, b, c]
+inline void PermuteU16U8U8Bytes(uint8_t* p) {
+    const uint8_t b0 = p[0];
+    const uint8_t b1 = p[1];
+    const uint8_t b2 = p[2];
+    const uint8_t b3 = p[3];
+    p[0] = b2;
+    p[1] = b3;
+    p[2] = b1;
+    p[3] = b0;
+}
+
+// Mirrors portFixupMObjSub in port/bridge/lbreloc_byteswap.cpp.
+// MObjSub layout (30 words = 120 bytes):
+//   w[0]  bswap32          u16 pad00, u8 fmt, u8 siz
+//   w[1]  ok               u32 sprites (token)
+//   w[2]  rotate16         u16 unk08, u16 unk0A
+//   w[3]  rotate16         u16 unk0C, u16 unk0E
+//   w[4..11] ok            s32/f32/u32
+//   w[12] permute u16+u8u8 u16 flags + u8 block_fmt + u8 block_siz
+//   w[13] rotate16         u16 block_dxt, u16 unk36
+//   w[14] rotate16         u16 unk38, u16 unk3A
+//   w[15..19] ok           f32/u32
+//   w[20] bswap32          SYColorPack primcolor (u8 rgba)
+//   w[21] bswap32          u8 prim_l, u8 prim_m, u8[2] pad
+//   w[22] bswap32          SYColorPack envcolor
+//   w[23] bswap32          SYColorPack blendcolor
+//   w[24] bswap32          SYColorPack light1color
+//   w[25] bswap32          SYColorPack light2color
+//   w[26..29] ok           s32
+void ApplyMObjSubFixup(uint8_t* base) {
+    Bswap32Bytes      (base + 0  * 4);
+    Rotate16Bytes     (base + 2  * 4);
+    Rotate16Bytes     (base + 3  * 4);
+    PermuteU16U8U8Bytes(base + 12 * 4);
+    Rotate16Bytes     (base + 13 * 4);
+    Rotate16Bytes     (base + 14 * 4);
+    Bswap32Bytes      (base + 20 * 4);
+    Bswap32Bytes      (base + 21 * 4);
+    Bswap32Bytes      (base + 22 * 4);
+    Bswap32Bytes      (base + 23 * 4);
+    Bswap32Bytes      (base + 24 * 4);
+    Bswap32Bytes      (base + 25 * 4);
+}
+constexpr uint32_t kMObjSubSize = 120;
+
 // Walks the catalog for `file_id`, applies each in-scope family transform to
 // `data` in place, and returns the OR'd PROC_<FAMILY>_DONE bits for the
 // families that were actually touched. `data` must already have pass1+pass2
@@ -302,6 +351,12 @@ uint32_t ApplyStructFixupsInPlace(std::vector<uint8_t>& data, uint32_t file_id) 
             if (e->byte_offset + kBitmapSize > file_size) continue;
             ApplyBitmapFixup(data.data() + e->byte_offset);
             flags_set |= kProcBitmapDone;
+            break;
+        }
+        case SSB64::StructFixupCatalog::MOBJSUB: {
+            if (e->byte_offset + kMObjSubSize > file_size) continue;
+            ApplyMObjSubFixup(data.data() + e->byte_offset);
+            flags_set |= kProcMobjsubDone;
             break;
         }
         // Other families land in subsequent Stage 6d steps.
