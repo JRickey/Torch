@@ -26,14 +26,21 @@ extern "C" {
 //    u32  processing_flags         (v1+; bit 0 = PROC_PASS1_BSWAP_DONE,
 //                                          bit 1 = PROC_PASS2_DONE,
 //                                          bits 2..7 = PROC_<FAMILY>_DONE,
-//                                          bit 8 = PROC_HALFSWAP_DONE)
+//                                          bit 8 = PROC_HALFSWAP_DONE,
+//                                          bit 10 = PROC_CHAIN_FLATTENED)
+//    u32  num_intern_chain_entries  (v2+)
+//    { u32 slot_byte_off, u32 target_byte_off }[num_intern_chain_entries]
+//    u32  num_extern_chain_entries  (v2+)
+//    { u32 slot_byte_off, u32 target_byte_off }[num_extern_chain_entries]
 //    u32  decompressed_data_size   (bytes)
 //    u8[decompressed_data_size]  decompressed_data   // post-Pass1+Pass2 if
 //                                                      both flags set
 //
-//  Header version is bumped to 1 because the runtime (port/resource) registers
-//  a separate V1 factory; v0 archives without `processing_flags` keep loading
-//  via the V0 factory and run every transform at runtime as before.
+//  Header version 1 added processing_flags (Pass1+Pass2+struct+halfswap moved
+//  to torch). Version 2 (current) adds the flat chain-entry sidecar (Stage 9
+//  chain-flatten). The runtime registers V0/V1/V2 factories; older archives
+//  keep loading via the matching factory and run skipped transforms at load
+//  time as before.
 //
 // ============================================================================
 
@@ -49,6 +56,8 @@ constexpr uint32_t kProcBitmapDone       = 1u << 5;
 constexpr uint32_t kProcMobjsubDone      = 1u << 6;
 constexpr uint32_t kProcFtAttributesDone = 1u << 7;
 constexpr uint32_t kProcHalfswapDone     = 1u << 8;
+// Bit 9 reserved-unused (Stage 7 closeout — AObjEvent32 walker stays runtime-side).
+constexpr uint32_t kProcChainFlattened   = 1u << 10;
 
 // F3DEX2 GBI opcode constants. Mirror port/bridge/lbreloc_byteswap.cpp.
 constexpr uint8_t  kGbiVtx        = 0x01;
@@ -499,6 +508,49 @@ uint32_t ApplyHalfswapInPlace(std::vector<uint8_t>& data,
     return kProcHalfswapDone;
 }
 
+// One pre-walked chain entry. byte offsets are relative to the start of
+// `data` (which the runtime later memcpys into its heap-resident buffer).
+// Mirrors port/resource/RelocFile.h::RelocChainEntry minus the DepFileId,
+// which the runtime fills from ExternFileIds[i] (chain-insertion order).
+struct ChainEntryOut {
+    uint32_t slot_byte_off;
+    uint32_t target_byte_off;
+};
+
+// Walks the encoded reloc chains in `data` and emits flat per-entry tuples.
+// Mirrors lbreloc_bridge.cpp's chain walker exactly (same termination rule,
+// same u32-read semantics). Safe to call after pass1+pass2+struct+halfswap
+// because every transform torch runs preserves the chain-slot u32 values
+// (pass1 byte-reverses each u32 in place — `ReadU32Native` on the result
+// yields the original BE value, same as the runtime does; pass2 skips slots
+// that aren't part of an in-DL G_VTX/G_SETTIMG; halfswap explicitly leaves
+// chain-slot u32s untouched).
+//
+// Defensive: bounded by `data.size() / 4` to catch corrupt cycles, identical
+// to the cap the halfswap walker uses above.
+void BuildChainEntries(const std::vector<uint8_t>& data,
+                       uint16_t reloc_intern, uint16_t reloc_extern,
+                       std::vector<ChainEntryOut>& intern_out,
+                       std::vector<ChainEntryOut>& extern_out) {
+    const size_t word_count = data.size() / 4;
+    auto walk = [&](uint16_t start, std::vector<ChainEntryOut>& out) {
+        uint16_t cur = start;
+        size_t   iter = 0;
+        while (cur != 0xFFFF && iter < word_count) {
+            if (static_cast<size_t>(cur) >= word_count) break;
+            const uint32_t w = ReadU32Native(data, static_cast<size_t>(cur) * 4);
+            ChainEntryOut e;
+            e.slot_byte_off   = static_cast<uint32_t>(cur) * 4u;
+            e.target_byte_off = static_cast<uint32_t>(w & 0xFFFFu) * 4u;
+            out.push_back(e);
+            cur = static_cast<uint16_t>(w >> 16);
+            iter++;
+        }
+    };
+    walk(reloc_intern, intern_out);
+    walk(reloc_extern, extern_out);
+}
+
 // Applies the pass2 byte transforms in place. Idempotent in the sense that
 // re-running it on already-pass2'd data would produce a different blob (it
 // would invert the transforms again); torch invokes it exactly once per file
@@ -602,8 +654,8 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     auto reloc = std::static_pointer_cast<SSB64::RelocData>(raw);
     auto writer = LUS::BinaryWriter();
 
-    // v1: post-Pass1 bytes + processing_flags advertise the transform.
-    WriteHeader(writer, Torch::ResourceType::SSB64Reloc, 1);
+    // v2: adds a flat chain-entry sidecar (Stage 9).
+    WriteHeader(writer, Torch::ResourceType::SSB64Reloc, 2);
 
     writer.Write(reloc->mFileId);
     writer.Write(reloc->mRelocInternOffset);
@@ -620,10 +672,32 @@ ExportResult SSB64::RelocBinaryExporter::Export(std::ostream& write,
     const uint32_t structFlags = ApplyStructFixupsInPlace(data, reloc->mFileId);
     const uint32_t halfswapFlags = ApplyHalfswapInPlace(
         data, reloc->mRelocInternOffset, reloc->mRelocExternOffset, entryName);
+
+    // Pre-walk the reloc chains and emit the flat per-entry list. Set
+    // PROC_CHAIN_FLATTENED so the runtime iterates the list and skips the
+    // encoded chain walk.
+    std::vector<ChainEntryOut> internEntries;
+    std::vector<ChainEntryOut> externEntries;
+    BuildChainEntries(data, reloc->mRelocInternOffset, reloc->mRelocExternOffset,
+                      internEntries, externEntries);
+
     const uint32_t processingFlags =
-        kProcPass1BswapDone | kProcPass2Done | structFlags | halfswapFlags;
+        kProcPass1BswapDone | kProcPass2Done | structFlags | halfswapFlags |
+        kProcChainFlattened;
 
     writer.Write(processingFlags);
+
+    writer.Write((uint32_t)internEntries.size());
+    for (const auto& e : internEntries) {
+        writer.Write(e.slot_byte_off);
+        writer.Write(e.target_byte_off);
+    }
+    writer.Write((uint32_t)externEntries.size());
+    for (const auto& e : externEntries) {
+        writer.Write(e.slot_byte_off);
+        writer.Write(e.target_byte_off);
+    }
+
     writer.Write((uint32_t)data.size());
     writer.Write((char*)data.data(), data.size());
 
