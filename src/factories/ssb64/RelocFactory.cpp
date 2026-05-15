@@ -834,6 +834,106 @@ void EmitChainPixelBuffers(const std::vector<uint8_t>& data,
     }
 }
 
+// Walks the chain entries (intern + extern) and, for any slot whose preceding
+// command word is a G_SETTIMG, emits a Tex / Tlut sub-resource at the chain
+// entry's target_byte_off. Mirrors `chain_fixup_settimg` in
+// port/bridge/lbreloc_byteswap.cpp byte-for-byte: walks forward from the
+// SETTIMG up to 8 cmds (64 bytes) looking for G_LOADBLOCK or G_LOADTLUT,
+// derives bpp from the SETTIMG's siz field, and computes byte size from the
+// LOADBLOCK lrs / LOADTLUT count using the same formulas the runtime uses.
+//
+// This catches DL-embedded textures whose w1 slot was a real-pointer reloc
+// at extract time (chain-encoded high bytes, NOT a literal seg=0x0E
+// reference) — the ScanDisplayLists `seg == 0x0E` filter skips those, but
+// the chain entries explicitly name them. Common in stage backgrounds and
+// fighter model DLs (the vast majority of in-DL texture references in
+// SSB64 are chain-resolved, not statically seg=0x0E).
+//
+// The runtime's `chain_fixup_settimg` will still apply BSWAP32 to the same
+// region at chain-walk time when no torch-side sub-resource override exists,
+// so emitting these as sub-resources is safe (idempotent w.r.t. transforms)
+// and gives modders a hash-addressable handle to override the pixel data.
+//
+// Vertex chain entries (G_VTX rooted) are intentionally NOT emitted here;
+// they ship as runtime-only fixups, matching the existing extraction policy
+// (vtx sub-resources are emitted only via the in-DL ScanDisplayLists path).
+void EmitChainSettimgPixelBuffers(const std::vector<uint8_t>& data,
+                                   const std::string& entryOtrPath,
+                                   const std::vector<ChainEntryOut>& internEntries,
+                                   const std::vector<ChainEntryOut>& externEntries,
+                                   std::vector<SubResource>& out) {
+    const size_t file_size = data.size();
+    if (file_size < 8) return;
+
+    auto process_entry = [&](const ChainEntryOut& ce) {
+        // The slot holds w1 of the cmd at slot_byte_off - 4 (which holds w0).
+        if (ce.slot_byte_off < 4) return;
+        if (static_cast<size_t>(ce.slot_byte_off) + 4 > file_size) return;
+        if (static_cast<size_t>(ce.target_byte_off) >= file_size) return;
+
+        const uint32_t w0 = ReadU32Native(data, ce.slot_byte_off - 4);
+        const uint8_t  opcode = static_cast<uint8_t>(w0 >> 24);
+        if (opcode != kGbiSettimg) return;
+
+        const uint32_t siz = (w0 >> 19) & 0x03;
+
+        // Walk forward up to 8 cmds looking for LOADBLOCK / LOADTLUT.
+        // Mirrors chain_fixup_settimg's lookahead loop exactly.
+        uint32_t loadblock_w1 = 0;
+        uint32_t loadtlut_w1  = 0;
+        int      found_load   = 0;
+        for (int step = 1; step <= 8; step++) {
+            const size_t walk_off =
+                static_cast<size_t>(ce.slot_byte_off) - 4 + static_cast<size_t>(step * 8);
+            if (walk_off + 8 > file_size) break;
+            const uint32_t walk_w0 = ReadU32Native(data, walk_off);
+            const uint32_t walk_w1 = ReadU32Native(data, walk_off + 4);
+            const uint8_t  walk_op = static_cast<uint8_t>(walk_w0 >> 24);
+            if (walk_op == kGbiLoadblock) { loadblock_w1 = walk_w1; found_load = 1; break; }
+            if (walk_op == kGbiLoadtlut)  { loadtlut_w1  = walk_w1; found_load = 2; break; }
+            if (walk_op == kGbiSettimg)   return;  // unrelated: this SETTIMG belongs to the next pair
+        }
+        if (!found_load) return;
+
+        uint32_t tex_bytes = 0;
+        SubResKind kind = SubResKind::Tex;
+        if (found_load == 1) {
+            uint32_t bpp = 0;
+            switch (siz) {
+            case kImSiz4b:  bpp = 4;  break;
+            case kImSiz8b:  bpp = 8;  break;
+            case kImSiz16b: bpp = 16; break;
+            case kImSiz32b: bpp = 32; break;
+            }
+            if (bpp == 0) return;
+            const uint32_t lrs        = (loadblock_w1 >> 12) & 0xFFF;
+            const uint32_t num_texels = lrs + 1;
+            tex_bytes = (num_texels * bpp + 7) / 8;
+            kind = SubResKind::Tex;
+        } else {
+            const uint32_t count = ((loadtlut_w1 >> 14) & 0x3FF) + 1;
+            tex_bytes = count * 2;
+            kind = SubResKind::Tlut;
+        }
+        tex_bytes = (tex_bytes + 3) & ~3u;
+        if (tex_bytes == 0) return;
+        if (static_cast<size_t>(tex_bytes) > (file_size - ce.target_byte_off))
+            tex_bytes = static_cast<uint32_t>(file_size - ce.target_byte_off) & ~3u;
+        if (tex_bytes == 0) return;
+
+        SubResource sr{};
+        sr.byte_offset = ce.target_byte_off;
+        sr.size        = tex_bytes;
+        sr.kind        = kind;
+        sr.hash        = CRC64(
+            SubResourceOtrPath(entryOtrPath, sr.kind, sr.byte_offset).c_str());
+        out.push_back(sr);
+    };
+
+    for (const auto& ce : internEntries) process_entry(ce);
+    for (const auto& ce : externEntries) process_entry(ce);
+}
+
 // Walks `data` (post all transforms) plus the struct catalog and emits one
 // SubResource per Vtx run / texture image / palette / fixed-up struct. The
 // path is computed via SubResourceOtrPath; the bytes are registered with
@@ -910,6 +1010,15 @@ EmitSubResources(const std::vector<uint8_t>& data,
 
     EmitChainPixelBuffers(data, file_id, entryOtrPath, chainSlotMap,
                           bitmapInCatalog, out);
+
+    // (d) Chain-rooted G_SETTIMG textures + palettes. Catches DL-embedded
+    // textures whose w1 slot is a chain-encoded reloc rather than a literal
+    // seg=0x0E reference — common in stage and fighter model DLs. Mirrors
+    // the runtime's chain_fixup_settimg sizing logic. Dedup below removes
+    // any overlap with section (a) for the rare DLs that statically encode
+    // both a seg=0x0E SETTIMG and a chain entry to the same target.
+    EmitChainSettimgPixelBuffers(data, entryOtrPath,
+                                  internEntries, externEntries, out);
 
     // Stable sort by (byte_offset, kind) so two extractions of the same ROM
     // produce identical container hash lists. ScanDisplayLists already walks
