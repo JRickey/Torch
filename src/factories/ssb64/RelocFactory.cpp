@@ -607,6 +607,13 @@ struct SubResource {
     uint32_t   byte_offset;
     uint32_t   size;
     SubResKind kind;
+    // When non-empty, the emitted Blob carries these exact bytes instead of a
+    // slice of the container's `data`. Used for 4c sprite buffers: the on-disk
+    // form is 2bpp-compressed but the mapping builder / Rice CRC expect the
+    // decoded 4bpp form the runtime produces. `size` then describes the
+    // payload length; `byte_offset` still names the on-disk buffer so the
+    // (offset, kind) dedup key stays stable across rebuilds.
+    std::vector<uint8_t> payload;
 };
 
 // Maps a Pass2 region to a sub-resource kind. ScanDisplayLists already
@@ -733,6 +740,97 @@ inline int BmsizToBpp(uint8_t bmsiz) {
     }
 }
 
+// G_IM_SIZ_4c (compressed-4b). The on-disk Bitmap.buf for a 4c sprite is a
+// 2bpp-packed run that lbCommonDecodeSpriteBitmapsSiz4b expands *in place* to
+// a 4bpp run before drawing. The buffer is reserved at the decoded 4bpp size
+// `(width_img/2) * actualHeight`; only its first half holds compressed bytes.
+constexpr uint8_t kBmsiz4c = 4;
+
+// Mirrors lbCommonGetBitmapDecodeNibble (decomp/src/lb/lbcommon.c): a 2-bit
+// code expands to one of four 4-bit grayscale levels.
+inline uint8_t Bitmap4cDecodeNibble(uint8_t index) {
+    static const uint8_t kLut[4] = {0x00, 0x05, 0x0A, 0x0F};
+    return kLut[index & 3];
+}
+
+// Mirrors lbCommonDecodeBitmapSiz4b byte-for-byte. Reads the compressed run
+// `[start .. csr]` *backward* (1 source byte → 2 destination bytes) and writes
+// the decoded 4bpp result forward from the buffer base. `out` must be sized at
+// the decoded length (decoded = compressed * 2). The runtime decodes in place;
+// torch decodes onto a private copy so the emitted sub-resource carries the
+// post-decode 4bpp bytes the Rice CRC / mapping builder expect (a 4c sprite
+// renders as CI4/I4 — fmt 2/4, siz 0 — which the on-disk 2bpp form never
+// matches).
+void DecodeBitmap4c(const uint8_t* src, size_t compressed_bytes,
+                    std::vector<uint8_t>& out) {
+    const size_t decoded = compressed_bytes * 2;
+    out.assign(decoded, 0);
+    if (decoded == 0) return;
+    // csr walks src[compressed_bytes-1 .. 0]; buf walks out[decoded-1] down by
+    // 2 per step. Indices mirror the pointer arithmetic in the decomp loop:
+    //   buf[0]  = nibble(csr&3) | nibble((csr&12)>>2)<<4
+    //   buf[-1] = nibble((csr&48)>>4)
+    //   buf[-1] |= nibble((csr&192)>>6) << 4   (deferred via temp/buf[1])
+    size_t csr = compressed_bytes;          // exclusive; predecrement below
+    size_t buf = decoded - 1;               // points at out[buf]
+    while (csr > 0) {
+        const uint8_t s = src[csr - 1];
+        out[buf]     = Bitmap4cDecodeNibble(s & 3);
+        out[buf]    |= static_cast<uint8_t>(Bitmap4cDecodeNibble((s & 12) >> 2) << 4);
+        out[buf - 1] = Bitmap4cDecodeNibble((s & 48) >> 4);
+        out[buf - 1] |= static_cast<uint8_t>(Bitmap4cDecodeNibble((s & 192) >> 6) << 4);
+        csr -= 1;
+        if (buf < 2) break;
+        buf -= 2;
+    }
+}
+
+// Reads a Bitmap's width_img (logical +0x02) and actualHeight (+0x0C) at
+// container offset `B`, accounting for whether the 16-byte Bitmap has had its
+// rotate16 struct fixup applied.
+//
+// A Bitmap (16 bytes) lays out:
+//   w[0] s16 width, s16 width_img        (rotate16 in portFixupBitmap)
+//   w[3] s16 actualHeight, s16 LUToffset (rotate16)
+// If the Bitmap is in the struct-fixup catalog, portFixupBitmap already ran
+// (torch applied it in ApplyStructFixupsInPlace) and the s16 fields are in
+// native LE order — ReadS16LE works directly. If it is NOT cataloged, the
+// word is still in pass1 (BSWAP32) state; the runtime fixes such bitmaps at
+// draw time via portFixupSpriteBitmapData, but torch never byte-rotated them.
+// We reconstruct the two s16 values from the pass1 byte order without
+// mutating `data`: post-pass1 word bytes are the original BE u32 reversed,
+// so [b0 b1 b2 b3] holds [hi16_lo hi16_hi lo16_lo lo16_hi] of the rotate16
+// target — equivalently, width_img (the low s16 of w[0]) is bytes [B+0,B+1]
+// and actualHeight (low s16 of w[3]) is bytes [B+0x0C,B+0x0D]. ReadS16LE at
+// the rotate16 positions therefore still recovers them: rotate16 only swaps
+// the two halves of the word, and ReadS16LE already targets the post-rotate
+// half offsets, so the pre-rotate bytes at those same offsets are the *other*
+// s16. We instead read the pre-rotate positions explicitly for the
+// non-cataloged case.
+//
+// Returns false if the geometry can't be trusted.
+bool ReadBitmapDims(const std::vector<uint8_t>& data, uint32_t B,
+                    const std::unordered_set<uint32_t>& bitmapInCatalog,
+                    int16_t& width_img, int16_t& actualHeight) {
+    if (static_cast<size_t>(B) + kBitmapSize > data.size()) return false;
+    if (bitmapInCatalog.count(B)) {
+        // portFixupBitmap (rotate16 on w[0], w[1], w[3]) already applied.
+        width_img    = ReadS16LE(data, B + 0x02);
+        actualHeight = ReadS16LE(data, B + 0x0C);
+        return true;
+    }
+    // Pass1-only (no rotate16). After ApplyPass1BswapInPlace a native u32
+    // read yields the original N64 BE word, so the logical s16 fields sit at
+    // their BE bit positions:
+    //   w[0]: width = bits[31:16], width_img = bits[15:0]
+    //   w[3]: actualHeight = bits[31:16], LUToffset = bits[15:0]
+    const uint32_t w0 = ReadU32Native(data, B + 0x00);
+    const uint32_t w3 = ReadU32Native(data, B + 0x0C);
+    width_img    = static_cast<int16_t>(w0 & 0xFFFF);
+    actualHeight = static_cast<int16_t>((w3 >> 16) & 0xFFFF);
+    return true;
+}
+
 // Walks the SPRITE entries in `file_id`'s catalog slice and emits Tex /
 // Tlut sub-resources for the chain-targeted pixel buffers and palettes —
 // the Stage-10 enumerator otherwise misses them because ScanDisplayLists
@@ -781,9 +879,10 @@ void EmitChainPixelBuffers(const std::vector<uint8_t>& data,
                     const uint32_t B =
                         bm_array_off + static_cast<uint32_t>(i) * kBitmapSize;
                     if (static_cast<size_t>(B) + kBitmapSize > file_size) break;
-                    if (bitmapInCatalog.count(B) == 0) continue;
-                    const int16_t width_img    = ReadS16LE(data, B + 0x02);
-                    const int16_t actualHeight = ReadS16LE(data, B + 0x0C);
+                    int16_t width_img, actualHeight;
+                    if (!ReadBitmapDims(data, B, bitmapInCatalog,
+                                        width_img, actualHeight))
+                        continue;
                     if (width_img <= 0 || actualHeight <= 0) continue;
 
                     auto buf_it = chainSlotMap.find(B + 0x08);
@@ -830,6 +929,85 @@ void EmitChainPixelBuffers(const std::vector<uint8_t>& data,
                     out.push_back(sr);
                 }
             }
+        }
+    }
+}
+
+// Parallel to EmitChainPixelBuffers, but for G_IM_SIZ_4c sprites — the case
+// EmitChainPixelBuffers deliberately skips (BmsizToBpp returns 0 for bmsiz 4).
+//
+// A 4c sprite's on-disk Bitmap.buf holds a 2bpp-compressed run that the
+// runtime expands in place to 4bpp via lbCommonDecodeSpriteBitmapsSiz4b
+// before drawing. Logically the result is a CI4 / I4 image (fmt 2 or 4,
+// siz 0). The mapping builder hashes the decoded 4bpp bytes, so emitting the
+// raw on-disk 2bpp run never matches a Reloaded pack texture. This emitter
+// runs the same decode torch-side onto a private buffer and emits the
+// post-decode 4bpp bytes as the sub-resource payload.
+//
+// Buffer layout: the decoded run is `(width_img/2) * actualHeight` bytes;
+// the compressed source occupies the first half. The chain-targeted buffer
+// is reserved at the decoded size (the runtime decodes in place), so the
+// emitted sub-resource's `size` is the decoded length and `byte_offset` is
+// the on-disk buffer offset (kept for a stable dedup/path key).
+void EmitChainSprite4cPixelBuffers(
+        const std::vector<uint8_t>& data,
+        uint32_t file_id,
+        const std::string& entryOtrPath,
+        const std::unordered_map<uint32_t, uint32_t>& chainSlotMap,
+        const std::unordered_set<uint32_t>& bitmapInCatalog,
+        std::vector<SubResource>& out) {
+    const size_t file_size = data.size();
+    auto [first, last] = SSB64::StructFixupCatalog::EntriesForFile(
+        static_cast<uint16_t>(file_id));
+
+    for (const auto* e = first; e != last; ++e) {
+        if (e->family != SSB64::StructFixupCatalog::SPRITE) continue;
+        const uint32_t S = e->byte_offset;
+        if (S + kSpriteSize > file_size) continue;
+
+        const int16_t nbitmaps = ReadS16LE(data, S + 0x28);
+        const uint8_t bmsiz    = data[S + 0x31];
+        if (bmsiz != kBmsiz4c || nbitmaps <= 0) continue;
+
+        auto bm_it = chainSlotMap.find(S + 0x34);
+        if (bm_it == chainSlotMap.end()) continue;
+        const uint32_t bm_array_off = bm_it->second;
+
+        for (int i = 0; i < nbitmaps; i++) {
+            const uint32_t B =
+                bm_array_off + static_cast<uint32_t>(i) * kBitmapSize;
+            if (static_cast<size_t>(B) + kBitmapSize > file_size) break;
+            int16_t width_img, actualHeight;
+            if (!ReadBitmapDims(data, B, bitmapInCatalog, width_img, actualHeight))
+                continue;
+            if (width_img <= 0 || actualHeight <= 0) continue;
+
+            auto buf_it = chainSlotMap.find(B + 0x08);
+            if (buf_it == chainSlotMap.end()) continue;
+            const uint32_t pixel_off = buf_it->second;
+
+            // Mirrors lbCommonDecodeSpriteBitmapsSiz4b: decoded run is
+            // (width_img/2)*actualHeight bytes; compressed source is half that.
+            const size_t decoded_bytes =
+                static_cast<size_t>(width_img / 2) *
+                static_cast<size_t>(actualHeight);
+            if (decoded_bytes == 0 || (decoded_bytes & 1)) continue;
+            const size_t compressed_bytes = decoded_bytes / 2;
+            if (compressed_bytes == 0) continue;
+            if (static_cast<size_t>(pixel_off) > file_size) continue;
+            // The container reserves the full decoded run for in-place decode;
+            // require it to be present so the on-disk slice is well-formed.
+            if (decoded_bytes > (file_size - pixel_off)) continue;
+
+            SubResource sr{};
+            sr.byte_offset = pixel_off;
+            sr.size        = static_cast<uint32_t>(decoded_bytes);
+            sr.kind        = SubResKind::Tex;
+            sr.hash        = CRC64(
+                SubResourceOtrPath(entryOtrPath, sr.kind, pixel_off).c_str());
+            DecodeBitmap4c(data.data() + pixel_off, compressed_bytes,
+                           sr.payload);
+            out.push_back(std::move(sr));
         }
     }
 }
@@ -1020,25 +1198,41 @@ EmitSubResources(const std::vector<uint8_t>& data,
     EmitChainSettimgPixelBuffers(data, entryOtrPath,
                                   internEntries, externEntries, out);
 
+    // (e) Chain-resolved 4c sprite pixel buffers. EmitChainPixelBuffers skips
+    // bmsiz==4c (on-disk 2bpp); this decodes the run to the 4bpp form the
+    // runtime produces so the emitted bytes match the Rice CRC / mapping
+    // builder (4c renders as CI4/I4). Carries the decoded bytes as a payload.
+    EmitChainSprite4cPixelBuffers(data, file_id, entryOtrPath, chainSlotMap,
+                                  bitmapInCatalog, out);
+
     // Stable sort by (byte_offset, kind) so two extractions of the same ROM
     // produce identical container hash lists. ScanDisplayLists already walks
     // the DL stream in deterministic order, but multiple G_VTX regions can
     // share an offset (if a DL re-loads the same Vtx run with a different
     // count); group them in offset order to keep diffs reviewable.
+    // Within an (offset, kind) group, order payload-bearing entries first so
+    // the dedup below makes a decoded 4c blob authoritative over any
+    // same-offset on-disk-slice entry (their companion path is identical —
+    // only one blob can occupy it, and the decoded form is what the mapping
+    // builder must hash).
     std::stable_sort(out.begin(), out.end(),
                      [](const SubResource& a, const SubResource& b) {
                          if (a.byte_offset != b.byte_offset) return a.byte_offset < b.byte_offset;
-                         return static_cast<uint8_t>(a.kind) < static_cast<uint8_t>(b.kind);
+                         if (a.kind != b.kind)
+                             return static_cast<uint8_t>(a.kind) < static_cast<uint8_t>(b.kind);
+                         return (!a.payload.empty()) && b.payload.empty();
                      });
 
-    // Dedup by (byte_offset, kind, size). A given (offset, kind) is allowed
-    // to appear twice in the regions list (e.g. two G_VTX commands referencing
-    // the same Vtx run), but only one sub-resource needs to exist for it.
+    // Dedup. A given (offset, kind) is allowed to appear twice in the
+    // regions list (e.g. two G_VTX commands referencing the same Vtx run);
+    // only one sub-resource needs to exist for it. Two entries that share
+    // (offset, kind) collapse to one even with differing size, because they
+    // resolve to the same companion path — the sort above keeps the
+    // payload-bearing (decoded 4c) entry when one exists.
     out.erase(std::unique(out.begin(), out.end(),
                           [](const SubResource& a, const SubResource& b) {
                               return a.byte_offset == b.byte_offset
-                                  && a.kind == b.kind
-                                  && a.size == b.size;
+                                  && a.kind == b.kind;
                           }),
               out.end());
 
@@ -1047,7 +1241,20 @@ EmitSubResources(const std::vector<uint8_t>& data,
     // gCurrentDirectory; SubResourceCompanionPath strips that prefix so the
     // round-trip lands at SubResourceOtrPath in the archive.
     for (const auto& sr : out) {
-        auto blobBytes = BuildSubResourceBlob(data, sr.byte_offset, sr.size);
+        std::vector<char> blobBytes;
+        if (!sr.payload.empty()) {
+            // Decoded 4c (or any synthetic) payload: build a Blob over the
+            // private bytes rather than a slice of the container's `data`.
+            LUS::BinaryWriter blobWriter;
+            BaseExporter::WriteHeader(blobWriter, Torch::ResourceType::Blob, 0);
+            blobWriter.Write(static_cast<uint32_t>(sr.payload.size()));
+            blobWriter.Write(
+                reinterpret_cast<char*>(const_cast<uint8_t*>(sr.payload.data())),
+                sr.payload.size());
+            blobBytes = blobWriter.ToVector();
+        } else {
+            blobBytes = BuildSubResourceBlob(data, sr.byte_offset, sr.size);
+        }
         Companion::Instance->RegisterCompanionFile(
             SubResourceCompanionPath(entryOtrPath, sr.kind, sr.byte_offset),
             std::move(blobBytes));
