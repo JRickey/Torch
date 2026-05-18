@@ -756,13 +756,15 @@ inline uint8_t Bitmap4cDecodeNibble(uint8_t index) {
 // Mirrors lbCommonDecodeBitmapSiz4b byte-for-byte. Reads the compressed run
 // `[start .. csr]` *backward* (1 source byte → 2 destination bytes) and writes
 // the decoded 4bpp result forward from the buffer base. `out` must be sized at
-// the decoded length (decoded = compressed * 2). The runtime decodes in place;
-// torch decodes onto a private copy so the emitted sub-resource carries the
-// post-decode 4bpp bytes the Rice CRC / mapping builder expect (a 4c sprite
-// renders as CI4/I4 — fmt 2/4, siz 0 — which the on-disk 2bpp form never
-// matches).
-void DecodeBitmap4c(const uint8_t* src, size_t compressed_bytes,
-                    std::vector<uint8_t>& out) {
+// the decoded length (decoded = compressed * 2). Reference 4c expander kept
+// available for the offline hi-res mapping builder (which Rice-CRC-keys the
+// post-decode 4bpp bytes). NOT called from the sub-resource emitter — 4c
+// sub-resources ship the on-disk compressed slice so blob == container slice
+// (see EmitChainSprite4cPixelBuffers). [[maybe_unused]] keeps the in-tree
+// reference decoder from tripping -Wunused-function now that the emitter no
+// longer invokes it.
+[[maybe_unused]] void DecodeBitmap4c(const uint8_t* src, size_t compressed_bytes,
+                                     std::vector<uint8_t>& out) {
     const size_t decoded = compressed_bytes * 2;
     out.assign(decoded, 0);
     if (decoded == 0) return;
@@ -939,16 +941,26 @@ void EmitChainPixelBuffers(const std::vector<uint8_t>& data,
 // A 4c sprite's on-disk Bitmap.buf holds a 2bpp-compressed run that the
 // runtime expands in place to 4bpp via lbCommonDecodeSpriteBitmapsSiz4b
 // before drawing. Logically the result is a CI4 / I4 image (fmt 2 or 4,
-// siz 0). The mapping builder hashes the decoded 4bpp bytes, so emitting the
-// raw on-disk 2bpp run never matches a Reloaded pack texture. This emitter
-// runs the same decode torch-side onto a private buffer and emits the
-// post-decode 4bpp bytes as the sub-resource payload.
+// siz 0).
+//
+// We emit the sub-resource as the *on-disk compressed slice* — a plain
+// BuildSubResourceBlob view of `data`, exactly like every other Tex
+// sub-resource — NOT a torch-decoded 4bpp payload. A decoded payload can
+// never byte-equal the container slice, which (a) trips the regen
+// byte-identity gate and, worse, (b) makes the runtime overlay path
+// (portRelocBuildOverlay's identity short-circuit) treat the default
+// sub-resource as a permanent phantom override on every load, memcpy'ing
+// mismatched-size decoded bytes over the compressed buffer with no mod
+// present. Shipping the native compressed form keeps blob == slice: the
+// gate stays green, the runtime never false-overrides, and a 4c mod is
+// authored in the same on-disk form the runtime already decodes in place.
+// The offline hi-res mapping builder, which needs the decoded 4bpp bytes
+// for Rice-CRC keying, runs DecodeBitmap4c itself on the compressed slice.
 //
 // Buffer layout: the decoded run is `(width_img/2) * actualHeight` bytes;
-// the compressed source occupies the first half. The chain-targeted buffer
-// is reserved at the decoded size (the runtime decodes in place), so the
-// emitted sub-resource's `size` is the decoded length and `byte_offset` is
-// the on-disk buffer offset (kept for a stable dedup/path key).
+// the compressed source occupies the first half. `byte_offset` is the
+// on-disk buffer offset and `size` is the compressed length (the half the
+// runtime reads before in-place expansion).
 void EmitChainSprite4cPixelBuffers(
         const std::vector<uint8_t>& data,
         uint32_t file_id,
@@ -1001,12 +1013,12 @@ void EmitChainSprite4cPixelBuffers(
 
             SubResource sr{};
             sr.byte_offset = pixel_off;
-            sr.size        = static_cast<uint32_t>(decoded_bytes);
+            sr.size        = static_cast<uint32_t>(compressed_bytes);
             sr.kind        = SubResKind::Tex;
             sr.hash        = CRC64(
                 SubResourceOtrPath(entryOtrPath, sr.kind, pixel_off).c_str());
-            DecodeBitmap4c(data.data() + pixel_off, compressed_bytes,
-                           sr.payload);
+            // No payload: emit the on-disk compressed slice (BuildSubResourceBlob
+            // views `data`) so blob == container slice. See header comment.
             out.push_back(std::move(sr));
         }
     }
