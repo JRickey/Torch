@@ -207,9 +207,10 @@ std::optional<std::tuple<std::string, YAML::Node>> SearchVtx(uint32_t ptr) {
         auto offset = GetSafeNode<uint32_t>(node, "offset");
         auto count = GetSafeNode<uint32_t>(node, "count");
         auto end = ALIGN16((count * sizeof(N64Vtx_t)));
+        auto base = ASSET_PTR(offset);
 
-        if (ptr > offset && ptr < offset + end) {
-            return std::make_tuple(GetSafeNode<std::string>(node, "symbol", name), node);
+        if (ptr > base && ptr < base + end) {
+            return std::make_tuple(name, node);
         }
     }
 
@@ -265,7 +266,7 @@ ExportResult DListBinaryExporter::Export(std::ostream& write, std::shared_ptr<IP
             auto overlap = GFXDOverride::GetVtxOverlap(ptr);
             if (overlap.has_value()) {
                 auto ovnode = std::get<1>(overlap.value());
-                auto path = Companion::Instance->RelativePath(std::get<0>(overlap.value()));
+                const auto& path = std::get<0>(overlap.value());
                 uint64_t hash = CRC64(path.c_str());
 
                 if (hash == 0) {
@@ -273,6 +274,9 @@ ExportResult DListBinaryExporter::Export(std::ostream& write, std::shared_ptr<IP
                 }
 
                 SPDLOG_INFO("Found vtx: 0x{:X} Hash: 0x{:X} Path: {}", ptr, hash, path);
+                if (entryName == "reloc_fighters_main/LinkModel/dLinkModel_Joint_0x1D88_DisplayList") {
+                    SPDLOG_CRITICAL("LINKMODEL_DEBUG overlap_vtx ptr=0x{:X} hash=0x{:X} path={}", ptr, hash, path);
+                }
 
                 auto offset = GetSafeNode<uint32_t>(ovnode, "offset");
                 auto count = GetSafeNode<uint32_t>(ovnode, "count");
@@ -299,6 +303,9 @@ ExportResult DListBinaryExporter::Export(std::ostream& write, std::shared_ptr<IP
                     }
 
                     SPDLOG_INFO("Found vtx: 0x{:X} Hash: 0x{:X} Path: {}", ptr, hash, dec.value());
+                    if (entryName == "reloc_fighters_main/LinkModel/dLinkModel_Joint_0x1D88_DisplayList") {
+                        SPDLOG_CRITICAL("LINKMODEL_DEBUG direct_vtx ptr=0x{:X} hash=0x{:X} path={}", ptr, hash, dec.value());
+                    }
 
                     N64Gfx value = gsSPVertexOTR(0, nvtx, didx);
 
@@ -483,7 +490,7 @@ std::optional<std::shared_ptr<IParsedData>> DListFactory::parse(std::vector<uint
     auto processing = true;
     size_t length = 0;
 
-    while (processing) {
+    while (processing && (count == -1 || length < static_cast<size_t>(count))) {
         auto w0 = reader.ReadUInt32();
         auto w1 = reader.ReadUInt32();
 
@@ -604,9 +611,7 @@ std::optional<std::shared_ptr<IParsedData>> DListFactory::parse(std::vector<uint
             }
         }
 
-        if (count != -1 && length++ >= count) {
-            break;
-        }
+        length++;
 
         gfxs.push_back(w0);
         gfxs.push_back(w1);

@@ -510,6 +510,10 @@ void Companion::ParseCurrentFileConfig(YAML::Node node, std::atomic<size_t>& ass
             std::make_tuple<uint32_t, uint32_t>(virtualAddrMap[0].as<uint32_t>(), virtualAddrMap[1].as<uint32_t>());
     }
 
+    if (node["ssb64_reloc_parent"]) {
+        this->gCurrentSSB64RelocParent = node["ssb64_reloc_parent"].as<std::string>();
+    }
+
     if (node["header"]) {
         auto header = node["header"];
         switch (this->gConfig.exporterType) {
@@ -728,6 +732,7 @@ void Companion::ProcessFile(YAML::Node root, std::atomic<size_t>& assetCount) {
     this->gFileHeader.clear();
     this->gCurrentPad = 0;
     this->gCurrentVram = std::nullopt;
+    this->gCurrentSSB64RelocParent = std::nullopt;
     this->gCurrentVirtualPath = "";
     this->gCurrentSegmentNumber = 0;
     this->gCurrentCompressionType = CompressionType::None;
@@ -801,12 +806,16 @@ void Companion::ProcessFile(YAML::Node root, std::atomic<size_t>& assetCount) {
                 stream.clear();
                 exporter->get()->Export(stream, data, result.name, result.node, &result.name);
                 auto data = stream.str();
+                const bool archiveAsset = GetSafeNode<bool>(result.node, "archive", true);
+
+                if (archiveAsset) {
                 this->gCurrentWrapper->AddFile(result.name, std::vector(data.begin(), data.end()));
 
                 for (auto& entry : this->gCompanionFiles) {
                     auto output = (this->gCurrentDirectory / entry.first).string();
                     std::replace(output.begin(), output.end(), '\\', '/');
                     this->gCurrentWrapper->AddFile(output, entry.second);
+                }
                 }
 
                 break;
@@ -1599,22 +1608,40 @@ std::optional<std::tuple<std::string, YAML::Node>> Companion::GetNodeByAddr(uint
     // HACK: Adjust address to rom address if virtual address
     addr = PatchVirtualAddr(addr);
 
-    if (!Torch::contains(this->gAddrMap[this->gCurrentFile], addr)) {
+    auto lookup = [this](uint32_t candidate) -> std::optional<std::tuple<std::string, YAML::Node>> {
+        if (Torch::contains(this->gAddrMap[this->gCurrentFile], candidate)) {
+            return this->gAddrMap[this->gCurrentFile][candidate];
+        }
+
         for (auto& file : this->gCurrentExternalFiles) {
             if (!Torch::contains(this->gAddrMap, file)) {
                 SPDLOG_WARN("GetNodeByAddr: External File {} Not Found.", file);
                 continue;
             }
 
-            if (!Torch::contains(this->gAddrMap[file], addr)) {
-                continue;
+            if (Torch::contains(this->gAddrMap[file], candidate)) {
+                return this->gAddrMap[file][candidate];
             }
-            return this->gAddrMap[file][addr];
         }
+
         return std::nullopt;
+    };
+
+    if (auto direct = lookup(addr); direct.has_value()) {
+        return direct;
     }
 
-    return this->gAddrMap[this->gCurrentFile][addr];
+    // Segmented display lists often refer to same-file assets by plain file
+    // offset, while the YAML first pass indexed explicit assets by segmented
+    // address. Try the current segment before falling back to autogen nodes.
+    if (!IS_SEGMENTED(addr) && gCurrentSegmentNumber != 0) {
+        uint32_t segmentedAddr = (gCurrentSegmentNumber << 24) | addr;
+        if (auto segmented = lookup(segmentedAddr); segmented.has_value()) {
+            return segmented;
+        }
+    }
+
+    return std::nullopt;
 }
 
 std::optional<std::string> Companion::GetStringByAddr(const uint32_t addr) {
@@ -1698,7 +1725,7 @@ std::optional<ParseResultData> Companion::GetParseDataByAddr(uint32_t addr) {
     }
 
     for (auto& file : this->gCurrentExternalFiles) {
-        if (!CONTAINS(this->gParseResults, this->gCurrentFile)) {
+        if (!CONTAINS(this->gParseResults, file)) {
             SPDLOG_INFO("GetParseDataByAddr: External File {} Not Found.", file);
             continue;
         }
@@ -1725,7 +1752,7 @@ std::optional<ParseResultData> Companion::GetParseDataBySymbol(const std::string
     }
 
     for (auto& file : this->gCurrentExternalFiles) {
-        if (!CONTAINS(this->gParseResults, this->gCurrentFile)) {
+        if (!CONTAINS(this->gParseResults, file)) {
             SPDLOG_INFO("GetParseDataBySymbol: External File {} Not Found.", file);
             continue;
         }

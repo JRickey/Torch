@@ -6,6 +6,7 @@
 #include <yaml-cpp/yaml.h>
 #include <optional>
 #include <cstdint>
+#include <string>
 #include "lib/binarytools/BinaryReader.h"
 
 enum class CompressionType {

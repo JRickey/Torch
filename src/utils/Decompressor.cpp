@@ -1,9 +1,12 @@
 #include "Decompressor.h"
 #include "TorchUtils.h"
 
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 #include "spdlog/spdlog.h"
 #include <Companion.h>
+#include "factories/ssb64/RelocFactory.h"
 
 extern "C" {
 #include <libmio0/mio0.h>
@@ -13,6 +16,57 @@ extern "C" {
 }
 
 std::unordered_map<uint32_t, DataChunk*> gCachedChunks;
+std::unordered_map<std::string, DataChunk*> gRelocatedRelocChunks;
+
+static uint32_t ReadBE32(const uint8_t* data) {
+    return (static_cast<uint32_t>(data[0]) << 24) | (static_cast<uint32_t>(data[1]) << 16) |
+           (static_cast<uint32_t>(data[2]) << 8) | static_cast<uint32_t>(data[3]);
+}
+
+static void WriteBE32(uint8_t* data, uint32_t value) {
+    data[0] = static_cast<uint8_t>((value >> 24) & 0xFF);
+    data[1] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    data[2] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    data[3] = static_cast<uint8_t>(value & 0xFF);
+}
+
+static DataChunk* GetSSB64RelocatedChunk() {
+    const auto parentSymbol = Companion::Instance->GetCurrentSSB64RelocParent();
+    if (!parentSymbol.has_value()) {
+        return nullptr;
+    }
+
+    const auto parentParse = Companion::Instance->GetParseDataBySymbol(parentSymbol.value());
+    if (!parentParse.has_value() || !parentParse->data.has_value()) {
+        throw std::runtime_error("Could not find parsed SSB64 reloc parent '" + parentSymbol.value() + "'");
+    }
+
+    if (Torch::contains(gRelocatedRelocChunks, parentParse->name)) {
+        return gRelocatedRelocChunks[parentParse->name];
+    }
+
+    const auto reloc = std::static_pointer_cast<SSB64::RelocData>(parentParse->data.value());
+    if (!reloc) {
+        throw std::runtime_error("Parsed reloc parent '" + parentSymbol.value() + "' is not SSB64::RelocData");
+    }
+
+    auto chunk = new DataChunk{ new uint8_t[reloc->mDecompressedData.size()], reloc->mDecompressedData.size() };
+    std::memcpy(chunk->data, reloc->mDecompressedData.data(), reloc->mDecompressedData.size());
+
+    const auto wordCount = chunk->size / sizeof(uint32_t);
+    auto current = reloc->mRelocInternOffset;
+    while (current != 0xFFFF && current < wordCount) {
+        const auto wordOffset = static_cast<size_t>(current) * sizeof(uint32_t);
+        const auto descriptor = ReadBE32(chunk->data + wordOffset);
+        const auto next = static_cast<uint16_t>((descriptor >> 16) & 0xFFFF);
+        const auto targetWord = static_cast<uint16_t>(descriptor & 0xFFFF);
+        WriteBE32(chunk->data + wordOffset, static_cast<uint32_t>(targetWord) * sizeof(uint32_t));
+        current = next;
+    }
+
+    gRelocatedRelocChunks[parentParse->name] = chunk;
+    return chunk;
+}
 
 DataChunk* Decompressor::Decode(const std::vector<uint8_t>& buffer, const uint32_t offset, const CompressionType type,
                                 bool ignoreCache) {
@@ -80,6 +134,32 @@ DataChunk* Decompressor::DecodeTKMK00(const std::vector<uint8_t>& buffer, const 
 DecompressedData Decompressor::AutoDecode(YAML::Node& node, std::vector<uint8_t>& buffer,
                                           std::optional<size_t> manualSize) {
     auto offset = GetSafeNode<uint32_t>(node, "offset");
+
+    if (auto* relocated = GetSSB64RelocatedChunk(); relocated != nullptr) {
+        if (offset > relocated->size) {
+            throw std::runtime_error("SSB64 reloc child offset is past relocated parent buffer");
+        }
+
+        auto availableSize = relocated->size - offset;
+        size_t size;
+
+        if (node["size"]) {
+            size = node["size"].as<size_t>();
+        } else if (manualSize.has_value()) {
+            size = manualSize.value();
+        } else {
+            size = availableSize;
+        }
+
+        if (size > availableSize) {
+            SPDLOG_WARN("Requested size 0x{:X} exceeds relocated SSB64 asset size 0x{:X} at offset 0x{:X}. Reducing to "
+                        "available size.",
+                        size, availableSize, offset);
+            size = availableSize;
+        }
+
+        return { .root = relocated, .segment = { relocated->data + offset, size } };
+    }
 
     CompressionType type = Companion::Instance->GetCurrCompressionType();
 
@@ -289,4 +369,9 @@ void Decompressor::ClearCache() {
         delete[] value->data;
     }
     gCachedChunks.clear();
+
+    for (auto& [key, value] : gRelocatedRelocChunks) {
+        delete[] value->data;
+    }
+    gRelocatedRelocChunks.clear();
 }

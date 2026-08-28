@@ -181,6 +181,7 @@ public:
     std::optional<std::uint32_t> GetCurrSegmentNumber(void) const { return this->gCurrentSegmentNumber; };
     CompressionType GetCurrCompressionType(void) const { return this->gCurrentCompressionType; };
     std::optional<VRAMEntry> GetCurrentVRAM(void) const { return this->gCurrentVram; };
+    std::optional<std::string> GetCurrentSSB64RelocParent() const { return this->gCurrentSSB64RelocParent; };
     std::optional<Table> SearchTable(uint32_t addr);
 
     static std::vector<char> ParseVersionString(const std::string& version);
@@ -230,6 +231,7 @@ private:
     uint32_t gCurrentFileOffset;
     uint32_t gCurrentSegmentNumber;
     std::optional<VRAMEntry> gCurrentVram;
+    std::optional<std::string> gCurrentSSB64RelocParent;
     CompressionType gCurrentCompressionType = CompressionType::None;
     std::vector<Table> gTables;
     std::vector<std::string> gCurrentExternalFiles;
