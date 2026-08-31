@@ -408,9 +408,13 @@ ExportResult DListBinaryExporter::Export(std::ostream& write, std::shared_ptr<IP
             auto ptr = w1;
             auto dec = Companion::Instance->GetSafeStringByAddr(ptr, "TEXTURE");
 
-            if (Companion::Instance->GetGBIMinorVersion() == GBIMinorVersion::PM64) {
+            if (Companion::Instance->GetGBIMinorVersion() == GBIMinorVersion::PM64 ||
+                Companion::Instance->GetCurrentSSB64RelocParent().has_value()) {
                 // preserve original w0 bits (fmt/siz/width) exactly, the
-                // ROM already stores width-1.
+                // ROM already stores width-1. SSB64 reloc slices need the
+                // same fidelity: the port re-synthesizes the bundle
+                // byte-for-byte, and the macro path below re-encodes
+                // width as (width)-1, turning the ROM's 0 into 0xFFF.
                 uint32_t newW0 = (G_SETTIMG_OTR_HASH << 24) | (w0 & 0x00FFFFFF);
                 writer.Write(newW0);
                 writer.Write(ptr);
@@ -466,6 +470,17 @@ ExportResult DListBinaryExporter::Export(std::ostream& write, std::shared_ptr<IP
 
         writer.Write(w0);
         writer.Write(w1);
+    }
+
+    // SSB64 joint DLs are count-delimited with no terminator; LUS's binary
+    // DisplayList factory reads until G_ENDDL, so append one for reloc
+    // slices. The port's synthesis drops it when rebuilding the byte-exact
+    // bundle image.
+    if (Companion::Instance->GetCurrentSSB64RelocParent().has_value() &&
+        (cmds.size() < 2 || (cmds[cmds.size() - 2] >> 24) != GBI(G_ENDDL))) {
+        N64Gfx end = gsSPRawOpcode(GBI(G_ENDDL));
+        writer.Write(end.words.w0);
+        writer.Write(end.words.w1);
     }
 
     writer.Finish(write);
