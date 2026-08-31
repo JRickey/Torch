@@ -1671,6 +1671,14 @@ std::optional<std::tuple<std::string, YAML::Node>> Companion::GetSafeNodeByAddr(
     auto n_type = GetTypeNode(n);
 
     if (n_type != type) {
+        // SSB64 reloc slice maps intentionally leave unproven regions as
+        // BLOB; a DL reference that lands on one is served as an
+        // unresolved literal (byte-preserving) rather than an error.
+        if (this->GetCurrentSSB64RelocParent().has_value()) {
+            SPDLOG_WARN("Node type mismatch at {} inside reloc parent (found {}, expected {}) — treating as unresolved",
+                        Torch::to_hex(addr, false), n_type, type);
+            return std::nullopt;
+        }
         throw std::runtime_error("Requested node type does not match with the target node type at " +
                                  Torch::to_hex(addr, false) + " Found: " + n_type + " Expected: " + type);
     }
@@ -1693,6 +1701,13 @@ std::optional<std::string> Companion::GetSafeStringByAddr(const uint32_t addr, s
     auto n_type = GetTypeNode(n);
 
     if (n_type != type) {
+        // See GetSafeNodeByAddr: inside an SSB64 reloc slice map a
+        // type-mismatched reference degrades to unresolved, not an error.
+        if (this->GetCurrentSSB64RelocParent().has_value()) {
+            SPDLOG_WARN("Node type mismatch at {} inside reloc parent (found {}, expected {}) — treating as unresolved",
+                        Torch::to_hex(addr, false), n_type, type);
+            return std::nullopt;
+        }
         throw std::runtime_error("Requested node type does not match with the target node type at " +
                                  Torch::to_hex(addr, false) + " Found: " + n_type + " Expected: " + type);
     }
