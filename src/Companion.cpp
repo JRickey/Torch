@@ -1434,7 +1434,9 @@ void Companion::Process(std::atomic<size_t>& assetCount) {
         SPDLOG_CRITICAL("Writing version file");
         wrapper->AddFile("version", vWriter.ToVector());
         vWriter.Close();
-        wrapper->Close();
+        if (wrapper->Close() != 0) {
+            throw std::runtime_error("Failed to write output archive " + this->gConfig.outputPath);
+        }
     }
 
     // Write entries hash
@@ -1513,7 +1515,9 @@ void Companion::Pack(const std::string& folder, const std::string& output, const
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
     SPDLOG_CRITICAL("------------------------------------------------");
 
-    wrapper->Close();
+    if (wrapper->Close() != 0) {
+        throw std::runtime_error("Failed to write output archive " + output);
+    }
 }
 
 std::optional<std::tuple<std::string, YAML::Node>> Companion::RegisterAsset(const std::string& name, YAML::Node& node) {

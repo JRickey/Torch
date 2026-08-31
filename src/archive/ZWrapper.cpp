@@ -39,6 +39,20 @@ bool ZWrapper::AddFile(const std::string& path, std::vector<char> data) {
 }
 
 int32_t ZWrapper::Close(void) {
-    this->mZip->save(this->mPath);
+    // miniz_cpp::zip_file::save(path) writes through a bare ofstream and
+    // never checks the stream state, so a failed open or a short write
+    // (disk full, permissions) succeeded silently. Own the stream and
+    // check it after the write.
+    std::ofstream stream(this->mPath, std::ios::binary);
+    if (!stream) {
+        SPDLOG_ERROR("Failed to open {} for writing", this->mPath);
+        return 1;
+    }
+    this->mZip->save(stream);
+    stream.flush();
+    if (!stream) {
+        SPDLOG_ERROR("Short write saving {} (disk full?)", this->mPath);
+        return 1;
+    }
     return 0;
 }
