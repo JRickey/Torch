@@ -274,9 +274,6 @@ ExportResult DListBinaryExporter::Export(std::ostream& write, std::shared_ptr<IP
                 }
 
                 SPDLOG_INFO("Found vtx: 0x{:X} Hash: 0x{:X} Path: {}", ptr, hash, path);
-                if (entryName == "reloc_fighters_main/LinkModel/dLinkModel_Joint_0x1D88_DisplayList") {
-                    SPDLOG_CRITICAL("LINKMODEL_DEBUG overlap_vtx ptr=0x{:X} hash=0x{:X} path={}", ptr, hash, path);
-                }
 
                 auto offset = GetSafeNode<uint32_t>(ovnode, "offset");
                 auto count = GetSafeNode<uint32_t>(ovnode, "count");
@@ -303,9 +300,6 @@ ExportResult DListBinaryExporter::Export(std::ostream& write, std::shared_ptr<IP
                     }
 
                     SPDLOG_INFO("Found vtx: 0x{:X} Hash: 0x{:X} Path: {}", ptr, hash, dec.value());
-                    if (entryName == "reloc_fighters_main/LinkModel/dLinkModel_Joint_0x1D88_DisplayList") {
-                        SPDLOG_CRITICAL("LINKMODEL_DEBUG direct_vtx ptr=0x{:X} hash=0x{:X} path={}", ptr, hash, dec.value());
-                    }
 
                     N64Gfx value = gsSPVertexOTR(0, nvtx, didx);
 

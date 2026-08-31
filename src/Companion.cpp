@@ -806,16 +806,18 @@ void Companion::ProcessFile(YAML::Node root, std::atomic<size_t>& assetCount) {
                 stream.clear();
                 exporter->get()->Export(stream, data, result.name, result.node, &result.name);
                 auto data = stream.str();
+                // archive: false skips only this asset's blob; companion files
+                // (headers etc.) are still archived.
                 const bool archiveAsset = GetSafeNode<bool>(result.node, "archive", true);
 
                 if (archiveAsset) {
-                this->gCurrentWrapper->AddFile(result.name, std::vector(data.begin(), data.end()));
+                    this->gCurrentWrapper->AddFile(result.name, std::vector(data.begin(), data.end()));
+                }
 
                 for (auto& entry : this->gCompanionFiles) {
                     auto output = (this->gCurrentDirectory / entry.first).string();
                     std::replace(output.begin(), output.end(), '\\', '/');
                     this->gCurrentWrapper->AddFile(output, entry.second);
-                }
                 }
 
                 break;
