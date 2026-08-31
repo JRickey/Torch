@@ -3,15 +3,47 @@
 #include <factories/BaseFactory.h>
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 
 namespace SSB64 {
 
-// ROM layout constants for the US NTSC v1.0 ROM
-static constexpr uint32_t RELOC_TABLE_ROM_ADDR   = 0x001AC870;
-static constexpr uint32_t RELOC_FILE_COUNT        = 2132;
-static constexpr uint32_t RELOC_TABLE_ENTRY_SIZE  = 12;
-static constexpr uint32_t RELOC_TABLE_SIZE        = (RELOC_FILE_COUNT + 1) * RELOC_TABLE_ENTRY_SIZE;
-static constexpr uint32_t RELOC_DATA_START        = RELOC_TABLE_ROM_ADDR + RELOC_TABLE_SIZE;
+static constexpr uint32_t RELOC_TABLE_ENTRY_SIZE = 12;
+
+// N64 ROM header country-code byte (z64 / big-endian — Torch normalises
+// byte order before factories run). 'E' = NALE (US v1.0), 'J' = NALJ
+// (Nintendo All-Star! Dairantou Smash Brothers, Japan).
+static constexpr size_t ROM_COUNTRY_CODE_OFF = 0x3E;
+
+// Per-ROM-version reloc table layout. Table ROM addresses come from the
+// upstream decomp splat configs (smashbrothers.<v>.yaml:
+// `- [<addr>, bin, relocData]`); file counts from
+// relocFileDescriptions.<v>.txt. The SSB64:RELOC factory reads the table
+// straight from the ROM, so it must use the right base for the loaded ROM.
+struct RelocLayout {
+    uint32_t tableRomAddr;
+    uint32_t fileCount;
+    uint32_t entrySize;   // == RELOC_TABLE_ENTRY_SIZE
+    uint32_t tableSize;   // (fileCount + 1) * entrySize  (incl. sentinel)
+    uint32_t dataStart;   // tableRomAddr + tableSize
+};
+
+inline RelocLayout GetRelocLayout(const std::vector<uint8_t>& rom) {
+    uint8_t country = rom.size() > ROM_COUNTRY_CODE_OFF
+                          ? rom[ROM_COUNTRY_CODE_OFF] : (uint8_t)'E';
+    uint32_t addr, count;
+    switch (country) {
+        case 'J': addr = 0x001ACAF0u; count = 2107u; break; // NALJ
+        case 'E':
+        default:  addr = 0x001AC870u; count = 2132u; break; // NALE (US v1.0)
+    }
+    RelocLayout L{};
+    L.tableRomAddr = addr;
+    L.fileCount    = count;
+    L.entrySize    = RELOC_TABLE_ENTRY_SIZE;
+    L.tableSize    = (count + 1u) * RELOC_TABLE_ENTRY_SIZE;
+    L.dataStart    = addr + L.tableSize;
+    return L;
+}
 
 /**
  * Parsed reloc file data — holds decompressed file contents and relocation metadata.

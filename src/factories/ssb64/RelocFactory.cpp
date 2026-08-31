@@ -119,21 +119,25 @@ std::optional<std::shared_ptr<IParsedData>>
 SSB64::RelocFactory::parse(std::vector<uint8_t>& buffer, YAML::Node& node) {
     auto fileId = GetSafeNode<uint32_t>(node, "file_id");
 
-    if (fileId >= RELOC_FILE_COUNT) {
+    // Reloc table location/size depends on the loaded ROM's region
+    // (the factory reads the table straight from ROM).
+    const SSB64::RelocLayout L = SSB64::GetRelocLayout(buffer);
+
+    if (fileId >= L.fileCount) {
         throw std::runtime_error(
             "SSB64:RELOC file_id " + std::to_string(fileId) + " out of range");
     }
 
     // --- Read this file's table entry and the next (for computing extern region) ---
-    size_t tableOffset = RELOC_TABLE_ROM_ADDR + fileId * RELOC_TABLE_ENTRY_SIZE;
-    if (tableOffset + RELOC_TABLE_ENTRY_SIZE * 2 > buffer.size()) {
+    size_t tableOffset = L.tableRomAddr + fileId * L.entrySize;
+    if (tableOffset + L.entrySize * 2 > buffer.size()) {
         throw std::runtime_error("ROM too small to read table entry for file " +
                                   std::to_string(fileId));
     }
 
     LUS::BinaryReader tableReader(
         reinterpret_cast<char*>(buffer.data() + tableOffset),
-        RELOC_TABLE_ENTRY_SIZE * 2);
+        L.entrySize * 2);
     tableReader.SetEndianness(Torch::Endianness::Big);
 
     // Current entry
@@ -153,7 +157,7 @@ SSB64::RelocFactory::parse(std::vector<uint8_t>& buffer, YAML::Node& node) {
     uint32_t decompressedSizeBytes = (uint32_t)decompressedSizeWords * 4;
 
     // --- Locate data in ROM ---
-    size_t dataRomAddr = RELOC_DATA_START + dataOffset;
+    size_t dataRomAddr = L.dataStart + dataOffset;
 
     if (dataRomAddr + compressedSizeBytes > buffer.size()) {
         throw std::runtime_error(
@@ -187,7 +191,7 @@ SSB64::RelocFactory::parse(std::vector<uint8_t>& buffer, YAML::Node& node) {
     // External file IDs are stored as big-endian u16 values in ROM
     // immediately after the compressed data.
     size_t externRegionStart = dataRomAddr + compressedSizeBytes;
-    size_t externRegionEnd = RELOC_DATA_START + nextDataOffset;
+    size_t externRegionEnd = L.dataStart + nextDataOffset;
 
     std::vector<uint16_t> externFileIds;
 
